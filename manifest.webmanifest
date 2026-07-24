@@ -1,0 +1,27 @@
+{
+  "name": "昇進試験 学習",
+  "short_name": "昇進試験",
+  "description": "関西電力グループ昇進試験向け学習アプリ。SM-2間隔反復・アクティブリコール・穴埋め式採用。",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#08090F",
+  "theme_color": "#08090F",
+  "lang": "ja",
+  "dir": "ltr",
+  "icons": [
+    {
+      "src": "icon-192.png",
+      "sizes": "192x192",
+      "type": "image/png",
+      "purpose": "any maskable"
+    },
+    {
+      "src": "icon-512.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

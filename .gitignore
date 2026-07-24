@@ -1,0 +1,20 @@
+# ローカル専用・機密データ（GitHubへコミットしない）
+source-index.local.json
+source-index*.local.json
+local-private/
+private-source/
+questions-*.csv
+共通*.zip
+ソリューション*.zip
+*.pdf
+*.ppt
+*.pptx
+*.xls
+*.xlsx
+
+# OS / editor artifacts
+.DS_Store
+Thumbs.db
+__MACOSX/
+*.tmp
+*.bak
