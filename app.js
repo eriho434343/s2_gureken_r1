@@ -12,16 +12,21 @@
 // Constants & state
 // ============================================
 const DB_NAME = 'shoshin-shiken';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 const STORE_Q = 'questions';
 const STORE_P = 'progress';
 const STORE_S = 'sessions';
 const STORE_M = 'meta';
+const STORE_A = 'sourceAssets';
 
-const APP_VERSION = '2.2.0';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.3.0';  // バージョンが変わっても IndexedDB のデータは保持される
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
-const SOURCE_INDEX_SCHEMA_VERSION = 1;
-const SOURCE_INDEX_MAX_BYTES = 8 * 1024 * 1024;
+const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
+const SOURCE_INDEX_MAX_BYTES = 64 * 1024 * 1024;
+const SOURCE_ASSET_MAX_BYTES = 2 * 1024 * 1024;
+const SOURCE_ASSET_TOTAL_MAX_BYTES = 48 * 1024 * 1024;
+const SOURCE_ASSET_MAX_COUNT = 1000;
+const SOURCE_ASSET_CACHE_LIMIT = 12;
 
 const CATS = { common: '共通', solution: 'ソリューション', engineering: 'エンジニア' };
 
@@ -58,8 +63,8 @@ const state = {
   ttsEnabled: false,
   // 共通・ソリューション資料のローカル索引。本文はアプリ本体や同期ファイルへ含めない。
   sourceIndex: {
-    loaded: false, generatedAt: '', questionCount: 0, stats: {},
-    byId: new Map(), byHash: new Map(),
+    loaded: false, schemaVersion: 0, generatedAt: '', questionCount: 0, stats: {},
+    assetCount: 0, assetBytes: 0, byId: new Map(), byHash: new Map(),
   },
 };
 
@@ -87,6 +92,9 @@ function openDB() {
       }
       if (!d.objectStoreNames.contains(STORE_M)) {
         d.createObjectStore(STORE_M, { keyPath: 'key' });
+      }
+      if (!d.objectStoreNames.contains(STORE_A)) {
+        d.createObjectStore(STORE_A, { keyPath: 'id' });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -409,31 +417,86 @@ function contentHash(q) {
 
 
 // ============================================
-// Local/private source index
+// Local/private source index and page images
 // ============================================
-// 出典本文はGitHub公開物・JSONバックアップ・iCloud同期へ含めず、
-// 利用者が選んだJSONだけをこの端末のIndexedDB(meta)に保存する。
+// Source excerpts and page screenshots are never bundled into the public app.
+// The user-selected local JSON is split across IndexedDB metadata and Blob assets.
 function emptySourceIndex() {
   return {
-    loaded: false, generatedAt: '', questionCount: 0, stats: {},
-    byId: new Map(), byHash: new Map(),
+    loaded: false, schemaVersion: 0, generatedAt: '', questionCount: 0, stats: {},
+    assetCount: 0, assetBytes: 0, byId: new Map(), byHash: new Map(),
   };
 }
 
-function validateSourceIndex(data) {
-  if (!data || typeof data !== 'object' || Array.isArray(data)) {
-    throw new Error('出典データの形式が正しくありません');
+function isPlainObject(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+function validateSourcePageImage(pageImage) {
+  if (!isPlainObject(pageImage)) throw new Error('PDFページ画像情報が壊れています');
+  const assetId = String(pageImage.assetId || '');
+  if (!/^[A-Za-z0-9._:-]{1,120}$/.test(assetId)) {
+    throw new Error('PDFページ画像IDが正しくありません');
   }
-  if (data.schemaVersion !== SOURCE_INDEX_SCHEMA_VERSION) {
+  if (!Number.isInteger(pageImage.width) || pageImage.width < 1 || pageImage.width > 10000 ||
+      !Number.isInteger(pageImage.height) || pageImage.height < 1 || pageImage.height > 10000) {
+    throw new Error('PDFページ画像サイズが正しくありません');
+  }
+  const rects = pageImage.highlightRects == null ? [] : pageImage.highlightRects;
+  if (!Array.isArray(rects) || rects.length > 40) {
+    throw new Error('画像ハイライト情報が正しくありません');
+  }
+  for (const rect of rects) {
+    if (!isPlainObject(rect)) throw new Error('画像ハイライト座標が壊れています');
+    const values = ['x', 'y', 'w', 'h'].map(k => Number(rect[k]));
+    if (values.some(v => !Number.isFinite(v))) throw new Error('画像ハイライト座標が正しくありません');
+    const [x, y, w, h] = values;
+    if (x < 0 || y < 0 || w <= 0 || h <= 0 || x > 1 || y > 1 || x + w > 1.02 || y + h > 1.02) {
+      throw new Error('画像ハイライト座標が範囲外です');
+    }
+  }
+}
+
+function validateSourceAssets(assets) {
+  if (assets == null) return { count: 0, bytes: 0 };
+  if (!isPlainObject(assets)) throw new Error('ページ画像データが正しくありません');
+  const rows = Object.entries(assets);
+  if (rows.length > SOURCE_ASSET_MAX_COUNT) throw new Error('ページ画像が多すぎます');
+  let totalBytes = 0;
+  for (const [id, asset] of rows) {
+    if (!/^[A-Za-z0-9._:-]{1,120}$/.test(id) || !isPlainObject(asset)) {
+      throw new Error('ページ画像データが壊れています');
+    }
+    if (!['image/webp', 'image/jpeg', 'image/png'].includes(String(asset.mime || ''))) {
+      throw new Error('未対応のページ画像形式です');
+    }
+    if (!Number.isInteger(asset.width) || asset.width < 1 || asset.width > 10000 ||
+        !Number.isInteger(asset.height) || asset.height < 1 || asset.height > 10000) {
+      throw new Error('ページ画像サイズが正しくありません');
+    }
+    if (!Number.isInteger(asset.bytes) || asset.bytes < 1 || asset.bytes > SOURCE_ASSET_MAX_BYTES) {
+      throw new Error('ページ画像の容量が正しくありません');
+    }
+    if (typeof asset.data !== 'string' || asset.data.length < 4 ||
+        asset.data.length > Math.ceil(SOURCE_ASSET_MAX_BYTES * 4 / 3) + 8) {
+      throw new Error('ページ画像本体が正しくありません');
+    }
+    totalBytes += asset.bytes;
+    if (totalBytes > SOURCE_ASSET_TOTAL_MAX_BYTES) throw new Error('ページ画像の合計容量が大きすぎます');
+  }
+  return { count: rows.length, bytes: totalBytes };
+}
+
+function validateSourceIndex(data) {
+  if (!isPlainObject(data)) throw new Error('出典データの形式が正しくありません');
+  if (!SOURCE_INDEX_SCHEMA_VERSIONS.has(data.schemaVersion)) {
     throw new Error(`未対応の出典データ形式です (schemaVersion: ${data.schemaVersion ?? 'なし'})`);
   }
   if (!Array.isArray(data.entries) || data.entries.length > 20000) {
     throw new Error('出典エントリが正しくありません');
   }
   for (const entry of data.entries) {
-    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) {
-      throw new Error('出典エントリが壊れています');
-    }
+    if (!isPlainObject(entry)) throw new Error('出典エントリが壊れています');
     const id = entry.id == null ? '' : String(entry.id);
     const hash = entry.contentHash == null ? '' : String(entry.contentHash);
     if (!id && !hash) throw new Error('問題との照合キーがない出典エントリがあります');
@@ -443,7 +506,7 @@ function validateSourceIndex(data) {
     const refs = entry.references == null ? [] : entry.references;
     if (!Array.isArray(refs) || refs.length > 8) throw new Error('出典参照の形式が正しくありません');
     for (const ref of refs) {
-      if (!ref || typeof ref !== 'object' || Array.isArray(ref)) throw new Error('出典参照が壊れています');
+      if (!isPlainObject(ref)) throw new Error('出典参照が壊れています');
       if (String(ref.document || '').length > 600 || String(ref.excerpt || '').length > 6000) {
         throw new Error('出典本文が大きすぎます');
       }
@@ -458,8 +521,10 @@ function validateSourceIndex(data) {
           throw new Error('マーカー情報が大きすぎます');
         }
       }
+      if (ref.pageImage != null) validateSourcePageImage(ref.pageImage);
     }
   }
+  validateSourceAssets(data.assets);
   return data;
 }
 
@@ -474,9 +539,12 @@ function setSourceIndexData(data) {
   }
   state.sourceIndex = {
     loaded: true,
+    schemaVersion: Number(data.schemaVersion) || 1,
     generatedAt: typeof data.generatedAt === 'string' ? data.generatedAt : '',
     questionCount: Number(data.questionCount) || data.entries.length,
-    stats: data.stats && typeof data.stats === 'object' ? data.stats : {},
+    stats: isPlainObject(data.stats) ? data.stats : {},
+    assetCount: Number(data.assetCount) || 0,
+    assetBytes: Number(data.assetBytes) || 0,
     byId,
     byHash,
   };
@@ -497,27 +565,107 @@ async function loadLocalSourceIndex() {
   }
 }
 
+function base64ToBlob(base64, mime) {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+  return new Blob([bytes], { type: mime });
+}
+
+function prepareSourceDataForStorage(data) {
+  const assets = isPlainObject(data.assets) ? data.assets : {};
+  const records = [];
+  for (const [id, asset] of Object.entries(assets)) {
+    let blob;
+    try {
+      blob = base64ToBlob(asset.data, asset.mime);
+    } catch (e) {
+      throw new Error(`ページ画像 ${id} を展開できません`);
+    }
+    if (blob.size !== asset.bytes) throw new Error(`ページ画像 ${id} の容量が一致しません`);
+    records.push({
+      id,
+      blob,
+      mime: asset.mime,
+      width: asset.width,
+      height: asset.height,
+      bytes: blob.size,
+      sha256: typeof asset.sha256 === 'string' ? asset.sha256 : '',
+    });
+  }
+
+  const referenced = new Set();
+  for (const entry of data.entries) {
+    for (const ref of entry.references || []) {
+      const aid = ref && ref.pageImage && String(ref.pageImage.assetId || '');
+      if (aid) referenced.add(aid);
+    }
+  }
+  if (referenced.size > 0) {
+    const available = new Set(records.map(record => record.id));
+    for (const id of referenced) {
+      if (!available.has(id)) throw new Error(`ページ画像 ${id} が出典パック内にありません`);
+    }
+  }
+
+  const indexData = { ...data };
+  delete indexData.assets;
+  indexData.assetCount = records.length;
+  indexData.assetBytes = records.reduce((sum, record) => sum + record.bytes, 0);
+  validateSourceIndex(indexData);
+  return { indexData, records };
+}
+
+function replaceLocalSourceData(indexData, assetRecords) {
+  return new Promise((resolve, reject) => {
+    const t = db.transaction([STORE_M, STORE_A], 'readwrite');
+    t.onerror = () => reject(t.error || new Error('出典データを保存できませんでした'));
+    t.onabort = () => reject(t.error || new Error('出典データの保存が中断されました'));
+    t.oncomplete = resolve;
+    const assets = t.objectStore(STORE_A);
+    assets.clear();
+    for (const record of assetRecords) assets.put(record);
+    t.objectStore(STORE_M).put({ key: SOURCE_INDEX_META_KEY, value: indexData });
+  });
+}
+
 async function importLocalSourceIndex(file) {
   try {
     if (!file) return;
     if (file.size > SOURCE_INDEX_MAX_BYTES) {
-      throw new Error(`ファイルが大きすぎます (${Math.ceil(file.size / 1024 / 1024)}MB)。上限は8MBです`);
+      throw new Error(`ファイルが大きすぎます (${Math.ceil(file.size / 1024 / 1024)}MB)。上限は64MBです`);
     }
+    toast('ローカル出典データを読み込んでいます…');
+    await new Promise(resolve => setTimeout(resolve, 20));
     const data = validateSourceIndex(JSON.parse(await file.text()));
-    // metaは既存のバックアップ/iCloud同期の対象外。ローカル端末内だけに保持される。
-    await metaSet(SOURCE_INDEX_META_KEY, data);
-    setSourceIndexData(data);
+    const { indexData, records } = prepareSourceDataForStorage(data);
+    await replaceLocalSourceData(indexData, records);
+    clearSourceAssetUrlCache();
+    setSourceIndexData(indexData);
     renderSourceIndexStatus();
     const coverage = sourceCoverageStats();
-    toast(`出典データを読み込みました: 抜粋${coverage.excerpt}問 / マーカー${coverage.marked}問`);
+    const imageText = coverage.pageImage ? ` / ページ画像${coverage.pageImage}問` : '';
+    toast(`出典データを読み込みました: 抜粋${coverage.excerpt}問 / マーカー${coverage.marked}問${imageText}`);
   } catch (e) {
     console.error(e);
     toast('出典データの読み込み失敗: ' + e.message);
   }
 }
 
+function clearLocalSourceDataFromDB() {
+  return new Promise((resolve, reject) => {
+    const t = db.transaction([STORE_M, STORE_A], 'readwrite');
+    t.onerror = () => reject(t.error);
+    t.oncomplete = resolve;
+    t.objectStore(STORE_M).delete(SOURCE_INDEX_META_KEY);
+    t.objectStore(STORE_A).clear();
+  });
+}
+
 async function clearLocalSourceIndex() {
-  await dbDel(STORE_M, SOURCE_INDEX_META_KEY);
+  closeSourcePageViewer();
+  await clearLocalSourceDataFromDB();
+  clearSourceAssetUrlCache();
   state.sourceIndex = emptySourceIndex();
   renderSourceIndexStatus();
   toast('ローカル出典データを端末から削除しました');
@@ -530,14 +678,14 @@ function findSourceEntry(q) {
   if (id && state.sourceIndex.byId.has(id)) {
     const entry = state.sourceIndex.byId.get(id);
     const entryHash = entry.contentHash == null ? '' : String(entry.contentHash);
-    // 同じIDでも問題文・解答が編集済みなら、古い出典を表示しない。
+    // Do not show stale source data after the question or answer was edited.
     if (!entryHash || entryHash === hash) return entry;
   }
   return hash && state.sourceIndex.byHash.has(hash) ? state.sourceIndex.byHash.get(hash) : null;
 }
 
 function sourceCoverageStats() {
-  const result = { total: state.questions.length, matched: 0, excerpt: 0, marked: 0 };
+  const result = { total: state.questions.length, matched: 0, excerpt: 0, marked: 0, pageImage: 0, imageMarked: 0 };
   if (!state.sourceIndex.loaded) return result;
   for (const q of state.questions) {
     const entry = findSourceEntry(q);
@@ -546,6 +694,10 @@ function sourceCoverageStats() {
     const refs = Array.isArray(entry.references) ? entry.references : [];
     if (refs.some(ref => ref && ref.excerpt)) result.excerpt++;
     if (refs.some(ref => ref && Array.isArray(ref.highlights) && ref.highlights.length)) result.marked++;
+    if (refs.some(ref => ref && ref.pageImage && ref.pageImage.assetId)) result.pageImage++;
+    if (refs.some(ref => ref && ref.pageImage && Array.isArray(ref.pageImage.highlightRects) && ref.pageImage.highlightRects.length)) {
+      result.imageMarked++;
+    }
   }
   return result;
 }
@@ -556,7 +708,7 @@ function renderSourceIndexStatus() {
   if (!statusEl) return;
   if (!state.sourceIndex.loaded) {
     statusEl.className = 'source-index-status';
-    statusEl.innerHTML = '<strong>未読み込み</strong><span>出典JSONはこの端末にだけ保存されます</span>';
+    statusEl.innerHTML = '<strong>未読み込み</strong><span>出典データはこの端末にだけ保存されます</span>';
     if (clearBtn) clearBtn.disabled = true;
     return;
   }
@@ -566,10 +718,13 @@ function renderSourceIndexStatus() {
     const d = new Date(state.sourceIndex.generatedAt);
     if (!Number.isNaN(d.getTime())) generated = ` / 作成 ${d.toLocaleString('ja-JP')}`;
   }
+  const pageText = coverage.pageImage
+    ? `・ページ画像 ${coverage.pageImage}問(${state.sourceIndex.assetCount}枚)・画像ハイライト ${coverage.imageMarked}問`
+    : '';
   statusEl.className = 'source-index-status loaded';
   statusEl.innerHTML =
     `<strong>読み込み済み</strong>` +
-    `<span>照合 ${coverage.matched}/${coverage.total}問・本文抜粋 ${coverage.excerpt}問・マーカー ${coverage.marked}問${escapeHtml(generated)}</span>`;
+    `<span>照合 ${coverage.matched}/${coverage.total}問・本文抜粋 ${coverage.excerpt}問・マーカー ${coverage.marked}問${pageText}${escapeHtml(generated)}</span>`;
   if (clearBtn) clearBtn.disabled = false;
 }
 
@@ -604,6 +759,202 @@ function highlightSourceExcerpt(text, terms) {
   return out;
 }
 
+function sourcePercent(value) {
+  return (Math.max(0, Math.min(1, Number(value) || 0)) * 100).toFixed(4);
+}
+
+function sourcePageVisualHtml(ref, documentName) {
+  const pageImage = ref && ref.pageImage;
+  if (!pageImage || !pageImage.assetId) return '';
+  const rects = Array.isArray(pageImage.highlightRects) ? pageImage.highlightRects : [];
+  const marks = rects.map(rect =>
+    `<span class="source-page-mark" style="left:${sourcePercent(rect.x)}%;top:${sourcePercent(rect.y)}%;width:${sourcePercent(rect.w)}%;height:${sourcePercent(rect.h)}%"></span>`
+  ).join('');
+  const pageNo = Number.isInteger(ref.page) ? ref.page : '';
+  const isRaster = /\.(?:png|jpe?g|webp)$/i.test(documentName);
+  const pageLabel = isRaster ? '該当資料画像' : '該当PDFページ';
+  const note = rects.length
+    ? '<span class="source-page-key" aria-hidden="true"></span>黄色の枠が穴抜き解答の該当箇所です。'
+    : '画像上の解答位置は安全に特定できなかったため、下の原文マーカーをご確認ください。';
+  const alt = `${documentName}${pageNo ? ` PDF p.${pageNo}` : ''} のページ画像`;
+  return `<div class="source-page-visual${rects.length ? ' has-marks' : ''}" ` +
+    `data-source-asset-id="${escapeHtml(pageImage.assetId)}" ` +
+    `data-source-document="${escapeHtml(documentName)}" data-source-page="${escapeHtml(pageNo)}" ` +
+    `data-source-width="${pageImage.width}" tabindex="0" role="button" aria-label="${escapeHtml(alt)}を拡大表示">` +
+      `<div class="source-page-caption"><span>${pageLabel}</span><span>タップで拡大</span></div>` +
+      `<div class="source-page-stage" style="aspect-ratio:${pageImage.width}/${pageImage.height}">` +
+        `<div class="source-page-placeholder"><span class="source-page-spinner" aria-hidden="true"></span><span>ページ画像を読み込み中</span></div>` +
+        `<img class="source-page-image" alt="${escapeHtml(alt)}" loading="lazy" decoding="async" data-source-asset-id="${escapeHtml(pageImage.assetId)}">` +
+        `<div class="source-page-marks" aria-hidden="true">${marks}</div>` +
+      `</div>` +
+      `<p class="source-page-note">${note}</p>` +
+    `</div>`;
+}
+
+const sourceAssetUrlCache = new Map();
+let sourceAssetUseTick = 0;
+let sourcePageViewer = null;
+let sourceViewerPreviousFocus = null;
+
+function clearSourceAssetUrlCache() {
+  for (const item of sourceAssetUrlCache.values()) {
+    try { URL.revokeObjectURL(item.url); } catch (e) { /* ignore */ }
+  }
+  sourceAssetUrlCache.clear();
+}
+
+function pruneSourceAssetUrlCache() {
+  if (sourceAssetUrlCache.size <= SOURCE_ASSET_CACHE_LIMIT) return;
+  const active = new Set(Array.from(document.querySelectorAll('.source-page-image[data-source-asset-id]'))
+    .map(img => img.dataset.sourceAssetId).filter(Boolean));
+  const ordered = Array.from(sourceAssetUrlCache.entries()).sort((a, b) => a[1].used - b[1].used);
+  for (const [id, item] of ordered) {
+    if (sourceAssetUrlCache.size <= SOURCE_ASSET_CACHE_LIMIT) break;
+    if (active.has(id)) continue;
+    try { URL.revokeObjectURL(item.url); } catch (e) { /* ignore */ }
+    sourceAssetUrlCache.delete(id);
+  }
+}
+
+async function getSourceAssetUrl(id) {
+  const cached = sourceAssetUrlCache.get(id);
+  if (cached) {
+    cached.used = ++sourceAssetUseTick;
+    return cached.url;
+  }
+  const record = await dbGet(STORE_A, id);
+  if (!record || !(record.blob instanceof Blob)) return '';
+  const url = URL.createObjectURL(record.blob);
+  sourceAssetUrlCache.set(id, { url, used: ++sourceAssetUseTick });
+  pruneSourceAssetUrlCache();
+  return url;
+}
+
+function closeSourcePageViewer() {
+  if (!sourcePageViewer) return;
+  document.removeEventListener('keydown', handleSourceViewerKeydown);
+  sourcePageViewer.remove();
+  sourcePageViewer = null;
+  document.body.classList.remove('source-viewer-open');
+  if (sourceViewerPreviousFocus && document.contains(sourceViewerPreviousFocus)) {
+    try { sourceViewerPreviousFocus.focus(); } catch (e) { /* ignore */ }
+  }
+  sourceViewerPreviousFocus = null;
+}
+
+function handleSourceViewerKeydown(e) {
+  if (e.key === 'Escape') closeSourcePageViewer();
+}
+
+function openSourcePageViewer(wrapper) {
+  const originalStage = wrapper.querySelector('.source-page-stage');
+  const originalImage = wrapper.querySelector('.source-page-image');
+  if (!originalStage || !originalImage || !originalImage.src || !wrapper.classList.contains('is-ready')) return;
+  closeSourcePageViewer();
+  sourceViewerPreviousFocus = document.activeElement;
+
+  const viewer = document.createElement('div');
+  viewer.className = 'source-image-viewer';
+  viewer.setAttribute('role', 'dialog');
+  viewer.setAttribute('aria-modal', 'true');
+  viewer.setAttribute('aria-label', '出典ページ拡大表示');
+
+  const bar = document.createElement('div');
+  bar.className = 'source-image-viewer-bar';
+  const title = document.createElement('div');
+  title.className = 'source-image-viewer-title';
+  const titleStrong = document.createElement('strong');
+  titleStrong.textContent = wrapper.dataset.sourceDocument || '出典資料';
+  const titlePage = document.createElement('span');
+  titlePage.textContent = wrapper.dataset.sourcePage ? `PDF p.${wrapper.dataset.sourcePage}` : '資料画像';
+  title.append(titleStrong, titlePage);
+
+  const actions = document.createElement('div');
+  actions.className = 'source-image-viewer-actions';
+  const zoomButton = document.createElement('button');
+  zoomButton.type = 'button';
+  zoomButton.className = 'source-image-viewer-zoom';
+  zoomButton.textContent = '等倍表示';
+  const closeButton = document.createElement('button');
+  closeButton.type = 'button';
+  closeButton.className = 'source-image-viewer-close';
+  closeButton.setAttribute('aria-label', '閉じる');
+  closeButton.textContent = '×';
+  actions.append(zoomButton, closeButton);
+  bar.append(title, actions);
+
+  const scroll = document.createElement('div');
+  scroll.className = 'source-image-viewer-scroll';
+  const stage = originalStage.cloneNode(true);
+  stage.classList.add('source-image-viewer-stage', 'is-ready');
+  const placeholder = stage.querySelector('.source-page-placeholder');
+  if (placeholder) placeholder.remove();
+  const image = stage.querySelector('.source-page-image');
+  if (image) image.loading = 'eager';
+  const naturalWidth = Math.max(320, Math.min(1800, Number(wrapper.dataset.sourceWidth) || originalImage.naturalWidth || 900));
+  stage.style.setProperty('--source-natural-width', `${naturalWidth}px`);
+  scroll.append(stage);
+  viewer.append(bar, scroll);
+
+  closeButton.addEventListener('click', closeSourcePageViewer);
+  zoomButton.addEventListener('click', () => {
+    const actual = viewer.classList.toggle('is-actual');
+    zoomButton.textContent = actual ? '全体表示' : '等倍表示';
+    scroll.scrollTo({ top: 0, left: 0, behavior: 'smooth' });
+  });
+  viewer.addEventListener('click', e => {
+    if (e.target === viewer) closeSourcePageViewer();
+  });
+  document.body.appendChild(viewer);
+  document.body.classList.add('source-viewer-open');
+  sourcePageViewer = viewer;
+  document.addEventListener('keydown', handleSourceViewerKeydown);
+  closeButton.focus();
+}
+
+function bindSourcePageVisual(wrapper) {
+  if (wrapper.dataset.sourceViewerBound === '1') return;
+  wrapper.dataset.sourceViewerBound = '1';
+  wrapper.addEventListener('click', () => openSourcePageViewer(wrapper));
+  wrapper.addEventListener('keydown', e => {
+    if (e.key === 'Enter' || e.key === ' ') {
+      e.preventDefault();
+      openSourcePageViewer(wrapper);
+    }
+  });
+}
+
+function hydrateSourcePageImages(root) {
+  const wrappers = root.querySelectorAll('.source-page-visual[data-source-asset-id]');
+  wrappers.forEach(wrapper => {
+    bindSourcePageVisual(wrapper);
+    if (wrapper.dataset.sourceHydrated === '1') return;
+    wrapper.dataset.sourceHydrated = '1';
+    const image = wrapper.querySelector('.source-page-image');
+    const placeholderText = wrapper.querySelector('.source-page-placeholder span:last-child');
+    const assetId = wrapper.dataset.sourceAssetId;
+    if (!image || !assetId) return;
+    image.addEventListener('load', () => wrapper.classList.add('is-ready'), { once: true });
+    image.addEventListener('error', () => {
+      wrapper.classList.add('is-error');
+      if (placeholderText) placeholderText.textContent = 'ページ画像を読み込めませんでした';
+    }, { once: true });
+    getSourceAssetUrl(assetId).then(url => {
+      if (!document.contains(wrapper)) return;
+      if (!url) {
+        wrapper.classList.add('is-error');
+        if (placeholderText) placeholderText.textContent = 'ページ画像データが見つかりません';
+        return;
+      }
+      image.src = url;
+    }).catch(e => {
+      console.warn('ページ画像の読み込みに失敗しました', e);
+      wrapper.classList.add('is-error');
+      if (placeholderText) placeholderText.textContent = 'ページ画像を読み込めませんでした';
+    });
+  });
+}
+
 function renderQuestionSources(q) {
   const entry = findSourceEntry(q);
   const sourceLabel = String((entry && entry.source) || q.source || '').trim();
@@ -625,7 +976,8 @@ function renderQuestionSources(q) {
       const page = Number.isInteger(ref.page) && ref.page > 0 ? `<span class="source-page">PDF p.${ref.page}</span>` : '';
       body += `<article class="source-ref ${match}">` +
         `<div class="source-ref-head"><span class="source-badge ${match}">${badge}</span>${page}</div>` +
-        `<div class="source-document">${escapeHtml(documentName)}</div>`;
+        `<div class="source-document">${escapeHtml(documentName)}</div>` +
+        sourcePageVisualHtml(ref, documentName);
       if (ref.excerpt) {
         body += `<div class="source-excerpt">${highlightSourceExcerpt(ref.excerpt, ref.highlights)}</div>`;
         if (match === 'inferred') {
@@ -651,7 +1003,9 @@ function showQuestionSources(q) {
   const html = renderQuestionSources(q);
   el.innerHTML = html;
   el.hidden = !html;
+  if (html) hydrateSourcePageImages(el);
 }
+
 function shuffle(arr) {
   const a = arr.slice();
   for (let i = a.length - 1; i > 0; i--) {
@@ -915,6 +1269,7 @@ function confirm(msg) {
 // View routing
 // ============================================
 function showView(name) {
+  if (name !== 'view-study') closeSourcePageViewer();
   document.querySelectorAll('.view').forEach(v => v.classList.remove('active'));
   document.getElementById(name).classList.add('active');
   document.querySelectorAll('.tab').forEach(t => {
@@ -1136,6 +1491,7 @@ function startStudy(mode) {
 }
 
 function renderStudy() {
+  closeSourcePageViewer();
   const total = state.studyDeck.length;
   const idx = state.studyIdx;
   document.getElementById('progress-fill').style.width = `${(idx / total * 100)}%`;
@@ -2215,11 +2571,13 @@ async function resetProgress() {
 async function resetAll() {
   // 全ストアを1トランザクションでクリア
   await new Promise((resolve, reject) => {
-    const t = db.transaction([STORE_Q, STORE_P, STORE_S, STORE_M], 'readwrite');
+    const t = db.transaction([STORE_Q, STORE_P, STORE_S, STORE_M, STORE_A], 'readwrite');
     t.onerror = () => reject(t.error);
     t.oncomplete = resolve;
-    [STORE_Q, STORE_P, STORE_S, STORE_M].forEach(s => t.objectStore(s).clear());
+    [STORE_Q, STORE_P, STORE_S, STORE_M, STORE_A].forEach(s => t.objectStore(s).clear());
   });
+  closeSourcePageViewer();
+  clearSourceAssetUrlCache();
   state.questions = [];
   state.progress = {};
   state.sourceIndex = emptySourceIndex();

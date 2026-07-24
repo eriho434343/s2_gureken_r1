@@ -6,6 +6,7 @@
 <meta name="theme-color" content="#FAF9F4" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#08090F" media="(prefers-color-scheme: dark)">
 <title>昇進試験 学習</title>
+<link rel="icon" type="image/png" href="icon-192.png">
 <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -450,10 +451,10 @@
 
       <div class="settings-section">
         <h3>ローカル出典データ</h3>
-        <p class="hint">共通・ソリューション資料から作成した軽量な抜粋索引を、この端末のIndexedDBだけに保存します。GitHub、通常バックアップ、iCloud同期には含めません。</p>
+        <p class="hint">共通・ソリューション資料から作成した本文抜粋と必要なPDFページ画像を、この端末のIndexedDBだけに保存します。GitHub、通常バックアップ、iCloud同期には含めません。</p>
         <div class="source-index-card">
           <div class="source-index-status" id="source-index-status">
-            <strong>未読み込み</strong><span>出典JSONはこの端末にだけ保存されます</span>
+            <strong>未読み込み</strong><span>出典データはこの端末にだけ保存されます</span>
           </div>
           <div class="source-index-actions">
             <button class="btn-sync-action btn-sync-primary" id="btn-import-source-index">📚 出典データを読み込む</button>
@@ -461,7 +462,8 @@
           </div>
           <ul class="sync-notes">
             <li>全ての穴を回答した後だけ、解答の下に出典を表示</li>
-            <li>一致した語句はマーカー表示</li>
+            <li>文字の出典より上に該当ページ画像を表示し、タップで拡大</li>
+            <li>特定できた解答箇所は、ページ画像と原文の両方でハイライト</li>
             <li>本文一致が弱い問題は、誤表示を避けて出典名のみ表示</li>
           </ul>
         </div>
@@ -517,7 +519,7 @@
       <div class="settings-section about">
         <h3>このアプリ</h3>
         <p>SM-2間隔反復・アクティブリコール・インターリービング・穴埋め式を採用。完全オフライン動作・無料。</p>
-        <p class="hint">v2.2.0 / Build 2026.07 (ローカル出典・該当箇所マーカー)</p>
+        <p class="hint">v2.3.0 / Build 2026.07 (ローカルPDFページ画像・座標ハイライト)</p>
       </div>
     </div>
   </section>
@@ -538,6 +540,6 @@
   </div>
 </div>
 
-<script src="app.js?v=3.1.0"></script>
+<script src="app.js?v=3.2.0"></script>
 </body>
 </html>

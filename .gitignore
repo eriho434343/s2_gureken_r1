@@ -1,6 +1,9 @@
 # ローカル専用・機密データ（GitHubへコミットしない）
 source-index.local.json
 source-index*.local.json
+source-pack.local.json
+source-pack*.local.json
+source-pages.local.json
 local-private/
 private-source/
 questions-*.csv
