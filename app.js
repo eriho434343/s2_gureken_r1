@@ -20,7 +20,7 @@ const STORE_M = 'meta';
 const STORE_A = 'sourceAssets';
 const STORE_R = 'questionStats';
 
-const APP_VERSION = '2.6.2';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.6.3';  // バージョンが変わっても IndexedDB のデータは保持される
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
 const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
 const SOURCE_INDEX_MAX_BYTES = 64 * 1024 * 1024;
@@ -225,7 +225,15 @@ function isReinforcementBlank(s) {
   return s.st !== 'mastered' && s.correctCount > 0 && s.correctCount < MASTER_CORRECT_COUNT;
 }
 
-// 問題がいずれかのモードで選ばれたら、3回正解前の穴は期日に関係なく必ず再出題する。
+// 「新規を学ぶ」の対象は、問題内の全穴に学習履歴がなく、問題周回も0回の完全な未学習問題だけ。
+// 一部の穴だけを学習済み、正解1～2回の定着中、誤答済み、完了履歴のある問題は新規モードへ含めない。
+function isCompletelyUnstudiedQuestion(q, states = null) {
+  if (!q || completedQuestionRounds(q) > 0) return false;
+  const rows = Array.isArray(states) ? states : getBlankStates(q);
+  return rows.length > 0 && rows.every(s => s.st === 'new' && !s.prog && s.correctCount === 0);
+}
+
+// 問題が新規以外の学習モードで選ばれたら、3回正解前の穴は期日に関係なく必ず再出題する。
 // 習得済みの穴だけは入力対象から外し、問題文側へ正解を埋め込む。
 function qActiveBlanks(q) {
   return getBlankStates(q).filter(s => s.st !== 'mastered');
@@ -1682,7 +1690,7 @@ function getDeckCounts(catFilter) {
     if (catFilter !== 'all' && q.category !== catFilter) continue;
     const states = getBlankStates(q);
     const hasDue = states.some(s => s.st === 'due');
-    const hasNew = states.some(s => s.st === 'new');
+    const hasNew = isCompletelyUnstudiedQuestion(q, states);
     const hasReinforcement = states.some(isReinforcementBlank);
     if (hasDue || hasReinforcement) reviewIds.add(q.id);
     if (hasNew) newIds.add(q.id);
@@ -1725,7 +1733,7 @@ function renderHome() {
 
   // Sub labels
   document.getElementById('btn-review-sub').textContent = `期日・3回正解前の問題 (${due}問)`;
-  document.getElementById('btn-new-sub').textContent = `未学習${newq}問 + 定着中${reinforce}問`;
+  document.getElementById('btn-new-sub').textContent = `未学習問題 (${newq}問)`;
   const wrongN = getWrongCount(state.selectedCat);
   document.getElementById('btn-wrong-sub').textContent = `誤答${wrongN}問 + 定着中${reinforce}問`;
 
@@ -1826,12 +1834,13 @@ function buildDeck(mode) {
   const wrongList = [];
   const reinforcementList = [];
 
-  // 正解1～2回の「定着中」は、従来どおり全モードの候補へ必ず加える。
+  // 正解1～2回の「定着中」は、復習・混合・間違えた問題の候補へ加える。
+  // 「新規を学ぶ」は、全穴に学習履歴がない完全な未学習問題だけを対象にする。
   for (const q of state.questions) {
     if (!filterCat(q)) continue;
     const states = getBlankStates(q);
     const hasDue = states.some(s => s.st === 'due');
-    const hasNew = states.some(s => s.st === 'new');
+    const hasNew = isCompletelyUnstudiedQuestion(q, states);
     const hasWrong = states.some(s => s.prog && s.st !== 'mastered' && s.prog.lapses >= 1 && s.prog.interval < 14);
     const hasReinforcement = states.some(isReinforcementBlank);
     if (hasDue) dueList.push(q);
@@ -1851,7 +1860,8 @@ function buildDeck(mode) {
   if (mode === 'review') {
     deck = uniqueQuestions([...reinforce, ...dueOnly.slice(0, revCap)]);
   } else if (mode === 'new') {
-    deck = uniqueQuestions([...reinforce, ...newOnly.slice(0, newCap)]);
+    // 新規モードには定着中を混ぜず、完全な未学習問題だけを日次上限内で出題する。
+    deck = newOnly.slice(0, newCap);
   } else if (mode === 'wrong') {
     deck = uniqueQuestions([...reinforce, ...wrongOnly]);
   } else if (mode === 'mixed') {
