@@ -20,7 +20,7 @@ const STORE_M = 'meta';
 const STORE_A = 'sourceAssets';
 const STORE_R = 'questionStats';
 
-const APP_VERSION = '2.6.0';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.6.2';  // バージョンが変わっても IndexedDB のデータは保持される
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
 const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
 const SOURCE_INDEX_MAX_BYTES = 64 * 1024 * 1024;
@@ -34,7 +34,7 @@ const CATS = { common: '共通', solution: 'ソリューション', engineering:
 const state = {
   questions: [],          // [{id, category, question, answer, ...}]
   progress: {},           // {questionId: {ease, interval, reps, due, ...}}
-  questionStats: {},      // {questionId: {completedRounds, presentedCount, lastCompleted, contentHash}}
+  questionStats: {},      // {questionId: {completedRounds, presentedCount(互換用・完了数と同値), lastCompleted, contentHash}}
   dailyStudy: {},         // {YYYY-MM-DD: {date, studied, correct, newCount, reviewCount, ...}}
   settings: {
     examDate: '',
@@ -50,7 +50,6 @@ const state = {
   todaySeen: { new: 0, rev: 0 },  // counters reset daily
   studyDeck: [],          // current session queue
   studyIdx: 0,
-  studyPresentedKeys: new Set(), // 同一セッション内の再描画で出題回数を二重加算しない
   studyStats: { again: 0, hard: 0, good: 0, easy: 0, total: 0 },
   selectedCat: 'all',
   selectedSize: 10,
@@ -1086,13 +1085,13 @@ function questionHash(q) {
 function normalizeQuestionStat(raw, q = null) {
   if (!raw || !raw.questionId) return null;
   const completed = Math.max(0, Math.floor(Number(raw.completedRounds) || 0));
-  // v2.5以前には表示回数が無いため、少なくとも完了周回数ぶんは出題済みとして復元する。
-  const presented = Math.max(completed, Math.max(0, Math.floor(Number(raw.presentedCount) || 0)));
+  // v2.6.0で問題表示時に増えたpresentedCountは使わない。
+  // 回答対象の全穴を完了した回数だけを出題回数・問題周回数として扱う。
   return {
     questionId: String(raw.questionId),
     contentHash: q ? questionHash(q) : String(raw.contentHash || ''),
     completedRounds: completed,
-    presentedCount: presented,
+    presentedCount: completed,
     lastCompleted: typeof raw.lastCompleted === 'string' ? raw.lastCompleted : '',
   };
 }
@@ -1104,15 +1103,11 @@ function completedQuestionRounds(q) {
   return Math.max(0, Math.floor(Number(stat.completedRounds) || 0));
 }
 
-// 実際に問題画面へ表示した回数。旧データは完了周回数を下限として安全に復元する。
+// 出題優先に使う問題単位の完了回数。
+// 表示しただけ、または一部の穴だけを回答して中断した問題は増えない。
+// 関数名はv2.6.0のバックアップ・検証互換のため残す。
 function presentedQuestionCount(q) {
-  if (!q) return 0;
-  const stat = state.questionStats[q.id];
-  if (!stat || (stat.contentHash && stat.contentHash !== questionHash(q))) return 0;
-  return Math.max(
-    completedQuestionRounds(q),
-    Math.max(0, Math.floor(Number(stat.presentedCount) || 0)),
-  );
+  return completedQuestionRounds(q);
 }
 
 function currentQuestionRound(q) {
@@ -1151,15 +1146,28 @@ function inferQuestionStat(q) {
 async function loadQuestionStats() {
   const rows = await dbGetAll(STORE_R);
   state.questionStats = {};
+  const corrections = [];
   for (const raw of rows) {
     const stat = normalizeQuestionStat(raw);
-    if (stat) state.questionStats[stat.questionId] = stat;
+    if (!stat) continue;
+    state.questionStats[stat.questionId] = stat;
+    // v2.6.0の回答途中表示で増えたpresentedCountを、完了周回数へ戻して永続化する。
+    if (JSON.stringify(stat) !== JSON.stringify(raw)) corrections.push(stat);
+  }
+  if (corrections.length > 0) {
+    await new Promise((resolve, reject) => {
+      const t = db.transaction(STORE_R, 'readwrite');
+      t.onerror = () => reject(t.error);
+      t.oncomplete = resolve;
+      const s = t.objectStore(STORE_R);
+      for (const stat of corrections) s.put(stat);
+    });
   }
 }
 
 // v2.4以前には問題単位の周回記録が無かったため、穴ごとのレビュー回数から復元する。
 // 同じ問題の各穴は原則として同じセッションで回答されるため、最大レビュー回数を採用する。
-// v2.5以前の出題回数は記録されていないため、完了周回数を初期値として引き継ぐ。
+// 出題優先回数は常に完了周回数と同じ値にそろえる。
 async function migrateQuestionStats() {
   const qById = new Map(state.questions.map(q => [q.id, q]));
   const puts = [];
@@ -1252,47 +1260,39 @@ async function replaceQuestionStats(raw) {
   await migrateQuestionStats();
 }
 
-function markQuestionPresented(q) {
-  if (!q) return 0;
-  const raw = state.questionStats[q.id];
-  const validRaw = raw && (!raw.contentHash || raw.contentHash === questionHash(q)) ? raw : null;
-  const current = normalizeQuestionStat(validRaw, q) || {
-    questionId: q.id,
-    contentHash: questionHash(q),
-    completedRounds: 0,
-    presentedCount: 0,
-    lastCompleted: '',
-  };
-  const stat = {
-    ...current,
-    contentHash: questionHash(q),
-    presentedCount: Math.max(current.completedRounds, current.presentedCount) + 1,
-  };
-  state.questionStats[q.id] = stat;
-  // 表示を待たせない。IndexedDBへの書込みは開始順に処理され、完了時の保存で同じ値を保持する。
-  dbPut(STORE_R, stat).catch(e => console.error('出題回数を保存できませんでした', e));
-  return stat.presentedCount;
+function quizQuestionFullyCommitted(q, quiz = state.quiz) {
+  const target = quiz || {};
+  if (!q || !target.q || target.q.id !== q.id) return false;
+  const active = Array.isArray(target.active) ? target.active : [];
+  const results = Array.isArray(target.results) ? target.results : [];
+  return active.length > 0 && active.every((_, i) => results[i] && results[i].committed === true);
 }
 
-async function completeQuestionRound(q) {
+async function completeQuestionRound(q, quiz = state.quiz) {
   if (!q) return 0;
-  if (state.quiz.roundCommitted) return state.quiz.questionRound || completedQuestionRounds(q);
-  const shownRound = Math.max(1, Math.floor(Number(state.quiz.questionRound) || currentQuestionRound(q)));
+  const target = quiz || {};
+  if (target.roundCommitted) return completedQuestionRounds(q);
+  // 回答対象だった全穴の履歴が確定するまでは、問題周回・出題回数を一切増やさない。
+  if (!quizQuestionFullyCommitted(q, target)) return completedQuestionRounds(q);
   const previous = completedQuestionRounds(q);
-  const completedRounds = Math.max(previous + 1, shownRound);
-  const raw = state.questionStats[q.id];
-  const validRaw = raw && (!raw.contentHash || raw.contentHash === questionHash(q)) ? raw : null;
-  const current = normalizeQuestionStat(validRaw, q);
+  // 1回の全穴完了につき、必ずちょうど1回だけ増やす。
+  const completedRounds = previous + 1;
   const stat = {
     questionId: q.id,
     contentHash: questionHash(q),
     completedRounds,
-    presentedCount: Math.max(completedRounds, current ? current.presentedCount : 0),
+    presentedCount: completedRounds,
     lastCompleted: new Date().toISOString(),
   };
+  // 保存中の連続操作でも二重加算しない。保存失敗時だけ再試行可能に戻す。
+  target.roundCommitted = true;
   state.questionStats[q.id] = stat;
-  await dbPut(STORE_R, stat);
-  state.quiz.roundCommitted = true;
+  try {
+    await dbPut(STORE_R, stat);
+  } catch (e) {
+    target.roundCommitted = false;
+    throw e;
+  }
   return completedRounds;
 }
 
@@ -1803,7 +1803,8 @@ function uniqueQuestions(items) {
   return out;
 }
 
-// 問題単位の出題回数が少ない順。同数は毎回ランダムに並べる。
+// 問題単位の完了出題回数が少ない順。同数は毎回ランダムに並べる。
+// 回答途中で中断した問題は完了回数が増えないため、未出題と同じ優先度を保つ。
 // decorate-sort-undecorate方式により、sort比較中に乱数を呼ばず偏りを抑える。
 function prioritizeByFewestPresentations(items) {
   return uniqueQuestions(items)
@@ -1869,7 +1870,7 @@ function buildDeck(mode) {
   }
 
   // モード固有の対象範囲・日次上限・混合比率を保った候補集合全体を、
-  // 実出題回数の少ない順に並べ、同数だけランダム化する。
+  // 完了した出題回数の少ない順に並べ、同数だけランダム化する。
   deck = prioritizeByFewestPresentations(deck);
   if (size > 0 && deck.length > size) deck = deck.slice(0, size);
   return deck;
@@ -1902,7 +1903,6 @@ function startStudy(mode) {
   }
   state.studyDeck = deck;
   state.studyIdx = 0;
-  state.studyPresentedKeys = new Set();
   state.studyStats = { again: 0, hard: 0, good: 0, easy: 0, total: 0, mode };
   renderStudy();
   showView('view-study');
@@ -1917,12 +1917,9 @@ function renderStudy() {
   document.getElementById('progress-text').textContent = `${idx + 1} / ${total}`;
 
   const q = state.studyDeck[idx];
-  const presentationKey = `${idx}:${q.id}:${questionHash(q)}`;
-  if (!(state.studyPresentedKeys instanceof Set)) state.studyPresentedKeys = new Set();
-  if (!state.studyPresentedKeys.has(presentationKey)) {
-    state.studyPresentedKeys.add(presentationKey);
-    markQuestionPresented(q);
-  }
+
+  // 問題を表示しただけでは出題回数・問題周回・穴履歴を増やさない。
+  // その回の回答対象穴をすべて完了した時点でのみ確定する。
 
   // Meta
   const meta = [];
@@ -1961,7 +1958,7 @@ function renderStudy() {
   state.quiz = {
     q, active, idx: 0, results: [], hadNew,
     finished: false, phase: 'input', blankStart: 0,
-    masteredNow: [], questionRound, roundCommitted: false,
+    masteredNow: [], questionRound, roundCommitted: false, progressCommitted: false,
   };
 
   if (active.length > 0) {
@@ -2064,14 +2061,16 @@ function judgeQuizBlank() {
   if (state.ttsEnabled) speakNow(b.answer);
 }
 
-// 1穴の結果を確定(SM-2 + 習得判定 + 保存)
-async function commitBlank(idx) {
-  const r = state.quiz.results[idx];
-  if (!r || r.committed) return;
-  r.committed = true;
-  const b = state.quiz.active[idx];
+// 1穴ぶんの更新内容を作る。ここではstate/IndexedDBへまだ反映しない。
+function buildBlankProgressUpdate(idx, quiz = state.quiz) {
+  const target = quiz || {};
+  const r = Array.isArray(target.results) ? target.results[idx] : null;
+  const b = Array.isArray(target.active) ? target.active[idx] : null;
+  if (!r || !b) return null;
   const key = b.key;
-  let bp = state.progress[key] || newProgress(key);
+  let bp = state.progress[key]
+    ? JSON.parse(JSON.stringify(state.progress[key]))
+    : newProgress(key);
   normalizeProgressMastery(bp);
   const wasMastered = bp.mastered;
   const beforeCorrectCount = bp.correctCount;
@@ -2084,13 +2083,44 @@ async function commitBlank(idx) {
   bp.correctCount = r.correct
     ? Math.min(MASTER_CORRECT_COUNT, beforeCorrectCount + 1)
     : beforeCorrectCount;
-  if (bp.correctCount >= MASTER_CORRECT_COUNT) {
-    if (!wasMastered) state.quiz.masteredNow.push(b.label || (b.i + 1));
-    bp.mastered = true;
+  if (bp.correctCount >= MASTER_CORRECT_COUNT) bp.mastered = true;
+
+  return {
+    idx, key, bp,
+    correctCount: bp.correctCount,
+    newlyMastered: !wasMastered && bp.mastered,
+    masteredLabel: b.label || (b.i + 1),
+  };
+}
+
+// 回答対象の全穴が判定済みになった時だけ、穴履歴を1トランザクションで確定する。
+// 途中でホームへ戻る・再読込する・ブラウザを閉じる場合は、穴履歴も問題周回も増えない。
+async function commitQuizProgress(quiz = state.quiz) {
+  const target = quiz || {};
+  if (target.progressCommitted) return;
+  const active = Array.isArray(target.active) ? target.active : [];
+  const results = Array.isArray(target.results) ? target.results : [];
+  if (!active.length || !active.every((_, i) => results[i])) {
+    throw new Error('全ての穴の回答が完了していません');
   }
-  b.correctCount = bp.correctCount;
-  state.progress[key] = bp;
-  await dbPut(STORE_P, bp);
+  const updates = active.map((_, i) => buildBlankProgressUpdate(i, target));
+  if (updates.some(x => !x)) throw new Error('穴の学習履歴を作成できませんでした');
+
+  await new Promise((resolve, reject) => {
+    const t = db.transaction(STORE_P, 'readwrite');
+    t.onerror = () => reject(t.error);
+    t.oncomplete = resolve;
+    const s = t.objectStore(STORE_P);
+    for (const u of updates) s.put(u.bp);
+  });
+
+  for (const u of updates) {
+    state.progress[u.key] = u.bp;
+    target.active[u.idx].correctCount = u.correctCount;
+    target.results[u.idx].committed = true;
+    if (u.newlyMastered) target.masteredNow.push(u.masteredLabel);
+  }
+  target.progressCommitted = true;
 }
 
 // 解答モード: 次の穴 or 全完了
@@ -2099,19 +2129,32 @@ async function nextQuizBlank() {
     goNextQuestion();
     return;
   }
-  await commitBlank(state.quiz.idx);
+  if (state.quiz.phase !== 'judged') return;
   if (state.quiz.idx < state.quiz.active.length - 1) {
     state.quiz.idx += 1;
     renderQuizBlank();
   } else {
-    await finishQuizQuestion();
+    state.quiz.phase = 'committing';
+    const nextBtn = document.getElementById('btn-quiz-next');
+    nextBtn.disabled = true;
+    try {
+      await finishQuizQuestion();
+    } catch (e) {
+      state.quiz.phase = 'judged';
+      console.error('問題の学習履歴を保存できませんでした', e);
+      toast('保存に失敗しました。通信状態ではなく端末の空き容量をご確認ください');
+    } finally {
+      nextBtn.disabled = false;
+    }
   }
 }
 
-// 解答モード: 全穴判定後のサマリ。問題単位の評価は廃止(穴ごとに確定済み)。
+// 解答モード: 全穴判定後のサマリ。全穴の履歴と問題周回をここで初めて確定する。
 async function finishQuizQuestion() {
-  const { active, results, q, hadNew, masteredNow } = state.quiz;
-  state.quiz.phase = 'finished';
+  const quiz = state.quiz;
+  const { active, results, q, hadNew, masteredNow } = quiz;
+  await commitQuizProgress(quiz);
+  // 全ての保存・集計・問題周回確定が終わるまではcommittingのままにし、次問題へ進ませない。
   const correctCount = results.filter(r => r && r.correct).length;
   const allCorrect = correctCount === active.length;
 
@@ -2121,7 +2164,7 @@ async function finishQuizQuestion() {
   if (hadNew) await bumpTodayCounter('new');
   else await bumpTodayCounter('rev');
   await recordDailyStudy({ allCorrect, hadNew, mode: state.studyStats && state.studyStats.mode });
-  const completedRound = await completeQuestionRound(q);
+  const completedRound = await completeQuestionRound(q, quiz);
 
   // セッション統計(問題単位)
   state.studyStats.total += 1;
@@ -2146,6 +2189,7 @@ async function finishQuizQuestion() {
   document.getElementById('btn-quiz-judge').hidden = true;
   document.getElementById('btn-quiz-manual').hidden = true;
   document.getElementById('rating-grid').hidden = true;
+  quiz.phase = 'finished';
   const nextBtn = document.getElementById('btn-quiz-next');
   nextBtn.hidden = false;
   nextBtn.textContent = (state.studyIdx >= state.studyDeck.length - 1) ? '完了' : '次の問題へ';
@@ -2305,7 +2349,31 @@ function openEditor(qid) {
   showView('view-edit');
 }
 
+// 出題中に編集・保存した問題を、現在のセッションから除外して次へ進む。
+// 途中まで入力・判定していても、結果を見る前の履歴は従来どおり確定しない。
+// 問題自体は削除しないため、次回以降のセッションでは更新後の内容で通常どおり候補になりうる。
+function skipEditedQuestionInCurrentSession(questionId) {
+  if (!questionId) return false;
+  const currentIndex = Math.max(0, Math.floor(Number(state.studyIdx) || 0));
+  const previousLength = state.studyDeck.length;
+  state.studyDeck = state.studyDeck.filter(q => q && q.id !== questionId);
+  if (state.studyDeck.length === previousLength) return false;
+
+  // 編集前の問題に対する一時回答は破棄し、次の問題へ持ち越さない。
+  state.quiz = { active: [], idx: 0, results: [] };
+  if (state.studyDeck.length === 0 || currentIndex >= state.studyDeck.length) {
+    finishStudy();
+  } else {
+    // 現在位置の問題を除いたため、同じindexに繰り上がった次問題を表示する。
+    state.studyIdx = currentIndex;
+    renderStudy();
+    showView('view-study');
+  }
+  return true;
+}
+
 async function saveEditor() {
+  const savedEditingId = state.editingId;
   const qaRaw = document.getElementById('ed-qa').value.trim();
   if (!qaRaw) {
     toast('問題と解答は必須です');
@@ -2359,17 +2427,18 @@ async function saveEditor() {
     state.questions.push(rec);
   }
   await dbPut(STORE_Q, rec);
-  toast(state.editingId ? '保存しました' : '追加しました');
   state.editingId = null;
   const returnView = state.editingReturnView || 'view-list';
   state.editingReturnView = null;
   renderHome();
   renderList();
-  if (returnView === 'view-study') {
-    // 出題中に編集した場合: 問題内容が変わったので現在の問題を再描画して戻る
-    renderStudy();
-    showView('view-study');
+  if (returnView === 'view-study' && savedEditingId) {
+    // 出題中に編集・保存した問題は、このセッションから除外して再表示しない。
+    const skipped = skipEditedQuestionInCurrentSession(savedEditingId);
+    toast(skipped ? '保存しました。このセッションでは再出題しません' : '保存しました');
+    if (!skipped) showView('view-study');
   } else {
+    toast(savedEditingId ? '保存しました' : '追加しました');
     showView('view-list');
   }
 }
@@ -3307,7 +3376,7 @@ function bindEvents() {
     if (judgeBtn && !judgeBtn.hidden) {
       blockEnter();
       judgeQuizBlank();
-    } else if (nextBtn && !nextBtn.hidden) {
+    } else if (nextBtn && !nextBtn.hidden && !nextBtn.disabled) {
       // 次の穴 or 結果を見る or 次の問題へ
       blockEnter(200);  // 次問題ロード中は少し長めにブロック
       nextQuizBlank();
@@ -3337,8 +3406,14 @@ function bindEvents() {
     openEditor(q.id);
   });
   document.getElementById('btn-study-back').addEventListener('click', async () => {
-    if (state.studyIdx > 0) {
-      const ok = await confirm('セッションを中断します。\n途中の進捗は保存されています。');
+    if (state.quiz && state.quiz.phase === 'committing') {
+      toast('学習履歴を保存中です。完了後に戻ってください');
+      return;
+    }
+    const hasPartialAnswer = state.quiz && state.quiz.phase !== 'finished'
+      && Array.isArray(state.quiz.results) && state.quiz.results.some(Boolean);
+    if (state.studyIdx > 0 || hasPartialAnswer) {
+      const ok = await confirm('セッションを中断します。\n回答途中の問題は、穴の履歴・出題回数・問題周回に反映されません。');
       if (!ok) return;
     }
     stopTTS();
