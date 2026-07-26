@@ -1896,3 +1896,139 @@ body.source-viewer-open { overflow: hidden; }
 @media (max-width: 420px) {
   .source-index-actions { grid-template-columns: 1fr; }
 }
+
+/* ===== v2.4: 3回正解による穴の定着表示 ===== */
+.blank.blank-filled {
+  min-width: 0;
+  background: color-mix(in srgb, var(--good) 15%, var(--bg-1));
+  color: var(--good);
+  border-bottom-color: var(--good);
+  box-shadow: 0 1px 6px color-mix(in srgb, var(--good) 18%, transparent);
+}
+.quiz-blank-label .qbl-mastery {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--bg-soft);
+  color: var(--text-faint);
+  font-size: 10.5px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  vertical-align: 0.05em;
+}
+.quiz-feedback .fb-progress {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--good) 14%, var(--bg-1));
+  color: var(--good);
+  font-size: 11px;
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ===== v2.4: 日別学習問題数 ===== */
+.daily-study-trend {
+  background: var(--bg-1);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 14px;
+  box-shadow: var(--shadow-1);
+}
+.daily-trend-summary {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin-bottom: 14px;
+}
+.daily-trend-summary > div {
+  min-width: 0;
+  padding: 9px 6px;
+  text-align: center;
+  border-radius: 10px;
+  background: var(--bg-soft);
+}
+.daily-trend-summary span {
+  display: block;
+  margin-bottom: 3px;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-weight: 600;
+  letter-spacing: 0.03em;
+}
+.daily-trend-summary strong {
+  color: var(--text);
+  font-size: 19px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.daily-trend-summary small {
+  margin-left: 2px;
+  color: var(--text-muted);
+  font-size: 9px;
+}
+.daily-trend-scroll {
+  overflow-x: auto;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+  padding: 4px 0 2px;
+}
+.daily-trend-chart {
+  display: grid;
+  grid-template-columns: repeat(30, minmax(18px, 1fr));
+  gap: 4px;
+  min-width: 690px;
+  height: 178px;
+  padding-top: 4px;
+  border-bottom: 1px solid var(--border);
+}
+.daily-trend-day {
+  display: grid;
+  grid-template-rows: 18px 1fr 18px;
+  min-width: 0;
+  text-align: center;
+}
+.daily-trend-value {
+  overflow: hidden;
+  color: var(--text-faint);
+  font-size: 9px;
+  line-height: 16px;
+  font-variant-numeric: tabular-nums;
+}
+.daily-trend-bar-track {
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  min-height: 0;
+  border-radius: 5px 5px 0 0;
+  background: linear-gradient(to top, color-mix(in srgb, var(--primary) 4%, transparent), transparent);
+}
+.daily-trend-bar {
+  width: min(13px, 72%);
+  min-height: 0;
+  border-radius: 5px 5px 1px 1px;
+  background: linear-gradient(to top, var(--primary), var(--violet));
+  box-shadow: 0 0 8px color-mix(in srgb, var(--primary) 20%, transparent);
+  transition: height 0.45s var(--ease-out);
+}
+.daily-trend-label {
+  overflow: visible;
+  color: var(--text-faint);
+  font-size: 8.5px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+.daily-trend-note {
+  margin: 10px 0 0;
+  color: var(--text-faint);
+  font-size: 10px;
+  line-height: 1.55;
+}
+@media (max-width: 430px) {
+  .daily-trend-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

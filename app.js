@@ -19,7 +19,7 @@ const STORE_S = 'sessions';
 const STORE_M = 'meta';
 const STORE_A = 'sourceAssets';
 
-const APP_VERSION = '2.3.0';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.4.0';  // バージョンが変わっても IndexedDB のデータは保持される
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
 const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
 const SOURCE_INDEX_MAX_BYTES = 64 * 1024 * 1024;
@@ -33,6 +33,7 @@ const CATS = { common: '共通', solution: 'ソリューション', engineering:
 const state = {
   questions: [],          // [{id, category, question, answer, ...}]
   progress: {},           // {questionId: {ease, interval, reps, due, ...}}
+  dailyStudy: {},         // {YYYY-MM-DD: {date, studied, correct, newCount, reviewCount, ...}}
   settings: {
     examDate: '',
     newPerDay: 10,
@@ -145,10 +146,11 @@ async function metaGet(key) { const r = await dbGet(STORE_M, key); return r ? r.
 // ============================================
 // SM-2 algorithm
 // ============================================
-// 習得(マスター)の条件: 連続で速く正解した回数がこの値に達したら、その穴は卒業(以後出題しない)
-const MASTER_STREAK = 3;
-const BLANK_FAST_SEC = 30;  // 1穴あたりこの秒数以内なら「速い」(連続MASTER_STREAK回で習得卒業)
-const BLANK_SLOW_SEC = 60;  // これを超えると「遅い」
+// 習得(マスター)の条件: 同じ穴に累計3回正解したら習得。
+// 正解速度はSM-2評価にだけ使い、習得回数には影響させない。
+const MASTER_CORRECT_COUNT = 3;
+const BLANK_FAST_SEC = 30;  // 1穴あたりこの秒数以内ならSM-2上の「簡単」
+const BLANK_SLOW_SEC = 60;  // これを超えるとSM-2上の「難」
 
 // 文字列ハッシュ(djb2)
 function hashStr(s) {
@@ -160,14 +162,42 @@ function hashStr(s) {
 // 位置や問題文が変わっても、解答の中身が同じなら同じキー = 学習履歴が追従する。
 function blankKey(qid, answer) { return qid + '#' + hashStr(normalizeAns(answer)); }
 
+// 旧版の進捗を含め、その穴で何回正解したかを安全に取得する。
+// rating 2/3/4 はいずれも正解、rating 1 は不正解として扱う。
+function progressCorrectCount(p) {
+  if (!p) return 0;
+  const stored = Number(p.correctCount);
+  if (Number.isFinite(stored) && stored >= 0) {
+    return Math.min(MASTER_CORRECT_COUNT, Math.floor(stored));
+  }
+  if (p.mastered) return MASTER_CORRECT_COUNT;
+  let fromHistory = 0;
+  for (const h of (Array.isArray(p.history) ? p.history : [])) {
+    if (Number(h && h.r) >= 2) fromHistory += 1;
+  }
+  const legacyFast = Number.isFinite(Number(p.fastStreak)) ? Number(p.fastStreak) : 0;
+  return Math.min(MASTER_CORRECT_COUNT, Math.max(fromHistory, legacyFast, 0));
+}
+
+function normalizeProgressMastery(p) {
+  if (!p) return false;
+  const beforeCount = p.correctCount;
+  const beforeMastered = p.mastered;
+  let count = progressCorrectCount(p);
+  if (p.mastered) count = Math.max(count, MASTER_CORRECT_COUNT);
+  p.correctCount = Math.min(MASTER_CORRECT_COUNT, count);
+  p.mastered = !!p.mastered || p.correctCount >= MASTER_CORRECT_COUNT;
+  return beforeCount !== p.correctCount || beforeMastered !== p.mastered;
+}
+
 // 問題の穴一覧 [{label, answer}]。穴が無い場合は解答全体を1穴とみなす。
 function getBlanks(q) {
   const b = parseQuizBlanks(q.question, q.answer);
   if (b && b.length) return b;
   return [{ label: '', answer: (q.answer || '').trim() }];
 }
-// 各穴の状態を返す: [{i,label,answer,key,prog,st}] st='new'|'due'|'wait'|'mastered'
-// 同一問題内に同じ解答が複数あれば ~1, ~2 を付けて区別する。
+// 各穴の状態を返す: [{i,label,answer,key,prog,correctCount,st}]
+// st='new'|'due'|'wait'|'mastered'。同一問題内に同じ解答が複数あれば ~1, ~2 を付けて区別する。
 function getBlankStates(q) {
   const today = startOfDay();
   const blanks = getBlanks(q);
@@ -177,26 +207,28 @@ function getBlankStates(q) {
     const n = seen[base] || 0; seen[base] = n + 1;
     const key = n === 0 ? base : base + '~' + n;
     const bp = state.progress[key];
+    const correctCount = progressCorrectCount(bp);
     let st;
-    if (bp && bp.mastered) st = 'mastered';
+    if (bp && (bp.mastered || correctCount >= MASTER_CORRECT_COUNT)) st = 'mastered';
     else if (!bp || !bp.due) st = 'new';
     else st = startOfDay(new Date(bp.due)) <= today ? 'due' : 'wait';
-    return { i, label: b.label, answer: b.answer, key, prog: bp || null, st };
+    return { i, label: b.label, answer: b.answer, key, prog: bp || null, correctCount, st };
   });
 }
-// 今学習すべき穴(new または due)
-function qActiveBlanks(q) {
-  return getBlankStates(q).filter(s => s.st === 'new' || s.st === 'due');
+
+function isReinforcementBlank(s) {
+  return s.st !== 'mastered' && s.correctCount > 0 && s.correctCount < MASTER_CORRECT_COUNT;
 }
-// 「間違えた問題」モード用: new/dueに加え、まだ期日前でも
-// 直近で間違えた穴(lapses>=1かつ未習得)を出題対象に含める。
-// SM-2の間隔がまだ満了していなくても、ユーザーが明示的に選んだモードなので
-// 「学習対象の穴がありません」と出題できないのを避ける。
+
+// 問題がいずれかのモードで選ばれたら、3回正解前の穴は期日に関係なく必ず再出題する。
+// 習得済みの穴だけは入力対象から外し、問題文側へ正解を埋め込む。
+function qActiveBlanks(q) {
+  return getBlankStates(q).filter(s => s.st !== 'mastered');
+}
+
+// 「間違えた問題」でも同じルールを適用し、正解済み1～2回の穴を省略しない。
 function qWrongFocusBlanks(q) {
-  return getBlankStates(q).filter(s =>
-    s.st === 'new' || s.st === 'due' ||
-    (s.st === 'wait' && s.prog && !s.prog.mastered && s.prog.lapses >= 1 && s.prog.interval < 14)
-  );
+  return qActiveBlanks(q);
 }
 
 function newProgress(key) {
@@ -209,8 +241,9 @@ function newProgress(key) {
     due: null,        // null = new (never reviewed)
     lastReviewed: null,
     totalReviews: 0,
-    fastStreak: 0,    // 連続高速正解の回数
-    mastered: false,  // 習得済み(卒業)
+    correctCount: 0,  // 累計正解数。3回で習得
+    fastStreak: 0,    // 旧版互換・分析用。習得判定には使わない
+    mastered: false,  // 習得済み(次回以降は問題文に正解を表示)
     history: [],
   };
 }
@@ -242,7 +275,7 @@ function applySM2(p, rating) {
   const due = startOfDay(now);
   due.setDate(due.getDate() + p.interval);
   p.due = due.toISOString();
-  p.history.push({ d: now.toISOString().slice(0,10), r: rating, b: before, a: p.interval });
+  p.history.push({ d: dateKey(now), r: rating, b: before, a: p.interval });
   if (p.history.length > 100) p.history = p.history.slice(-100);
   return p;
 }
@@ -263,8 +296,12 @@ function startOfDay(d = new Date()) {
   const x = new Date(d); x.setHours(0,0,0,0); return x;
 }
 function dateKey(d = new Date()) {
-  const x = startOfDay(d);
-  return x.toISOString().slice(0, 10);
+  // UTC変換を挟まず、利用端末のローカル日付を使う。
+  const x = new Date(d);
+  const y = x.getFullYear();
+  const m = String(x.getMonth() + 1).padStart(2, '0');
+  const day = String(x.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
 }
 function daysBetween(a, b) {
   const ms = startOfDay(b) - startOfDay(a);
@@ -295,6 +332,42 @@ function renderBlanks(text) {
     return `<span class="blank">${inner || '　'}</span>`;
   });
 }
+
+// 出題画面専用。3回正解済みの穴は正解を埋め、未習得の穴だけを従来どおり空欄表示する。
+function renderStudyQuestion(q) {
+  const text = String((q && q.question) || '');
+  const states = getBlankStates(q);
+  const re = /【([^】]*)】/g;
+  let html = '';
+  let last = 0;
+  let i = 0;
+  let m;
+  while ((m = re.exec(text)) !== null) {
+    html += escapeHtml(text.slice(last, m.index));
+    const st = states[i++];
+    if (st && st.st === 'mastered') {
+      html += `<span class="blank blank-filled" title="3回正解済み">${escapeHtml(st.answer)}</span>`;
+    } else {
+      const label = (m[1] || '').trim();
+      html += `<span class="blank">${escapeHtml(label) || '　'}</span>`;
+    }
+    last = m.index + m[0].length;
+  }
+  html += escapeHtml(text.slice(last));
+  return html;
+}
+
+function studyQuestionSpeechText(q) {
+  const states = getBlankStates(q);
+  let i = 0;
+  return String((q && q.question) || '').replace(/【([^】]*)】/g, (m, inner) => {
+    const st = states[i++];
+    if (st && st.st === 'mastered') return st.answer;
+    const label = (inner || '').trim();
+    return label ? `空欄${label}` : '空欄';
+  });
+}
+
 function renderAnswer(text) {
   // 改行は維持。①②...㊿ を少し強調。
   return escapeHtml(text).replace(/([①-⑳㉑-㊿])/g, '<span class="ans-num">$1</span>');
@@ -1017,7 +1090,8 @@ function shuffle(arr) {
 function cardStatus(q, p) {
   const states = getBlankStates(q);
   if (states.length && states.every(s => s.st === 'mastered')) return 'mastered';
-  if (states.some(s => s.prog && s.prog.lapses >= 4 && s.prog.interval < 7 && !s.prog.mastered)) return 'leech';
+  if (states.some(s => s.prog && s.prog.lapses >= 4 && s.prog.interval < 7 && s.st !== 'mastered')) return 'leech';
+  if (states.some(isReinforcementBlank)) return 'learning';
   const studied = states.some(s => s.prog);
   if (states.some(s => s.st === 'new')) return studied ? 'learning' : 'new';
   return 'review';
@@ -1054,6 +1128,10 @@ async function init() {
 
   // 旧 per-question 進捗 → 穴ごと進捗へマイグレーション(履歴を保持)
   await migrateProgressToPerBlank();
+  // 旧版の高速連続正解方式から、累計3回正解方式へ安全に移行する。
+  await migrateProgressCorrectCounts();
+  // 日別学習数を読み込み、更新前の履歴は問題単位へ重複除去して復元する。
+  await loadDailyStudyHistory();
 
   // Reset today's counters if new day
   await resetTodayIfNeeded();
@@ -1120,7 +1198,9 @@ async function migrateProgressToPerBlank() {
     np.lapses = old.lapses; np.due = old.due; np.lastReviewed = old.lastReviewed;
     np.totalReviews = old.totalReviews; np.history = old.history || [];
     np.mastered = old.mastered != null ? old.mastered : (old.interval >= 21);
-    np.fastStreak = old.fastStreak != null ? old.fastStreak : (np.mastered ? MASTER_STREAK : 0);
+    np.correctCount = old.correctCount != null ? old.correctCount : progressCorrectCount(old);
+    np.fastStreak = old.fastStreak != null ? old.fastStreak : (np.mastered ? MASTER_CORRECT_COUNT : 0);
+    normalizeProgressMastery(np);
   };
 
   for (const key of allKeys) {
@@ -1158,6 +1238,21 @@ async function migrateProgressToPerBlank() {
   for (const key of toDel) { delete state.progress[key]; await dbDel(STORE_P, key); }
 }
 
+async function migrateProgressCorrectCounts() {
+  const changed = [];
+  for (const p of Object.values(state.progress)) {
+    if (normalizeProgressMastery(p)) changed.push(p);
+  }
+  if (changed.length === 0) return;
+  await new Promise((resolve, reject) => {
+    const t = db.transaction(STORE_P, 'readwrite');
+    t.onerror = () => reject(t.error);
+    t.oncomplete = resolve;
+    const store = t.objectStore(STORE_P);
+    for (const p of changed) store.put(p);
+  });
+}
+
 // アプリバージョン管理: 更新検出と履歴保護通知
 async function checkVersionAndNotify() {
   const storedVersion = await metaGet('appVersion');
@@ -1191,6 +1286,107 @@ async function resetTodayIfNeeded() {
 async function bumpTodayCounter(kind) {
   state.todaySeen[kind] = (state.todaySeen[kind] || 0) + 1;
   await metaSet('todayCounters', { date: state.todayKey, ...state.todaySeen });
+}
+
+function progressKeyQuestionId(key) {
+  const s = String(key || '');
+  const i = s.indexOf('#');
+  return i >= 0 ? s.slice(0, i) : s;
+}
+
+// 旧版には日別問題数の専用記録がないため、穴の履歴を「日付×問題ID」で重複除去して復元する。
+function deriveDailyStudyCountsFromProgress() {
+  const byDate = {};
+  for (const [key, p] of Object.entries(state.progress)) {
+    const qid = progressKeyQuestionId(key);
+    for (const h of (Array.isArray(p.history) ? p.history : [])) {
+      const d = h && typeof h.d === 'string' ? h.d : '';
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) continue;
+      if (!byDate[d]) byDate[d] = new Set();
+      byDate[d].add(qid);
+    }
+  }
+  const out = {};
+  for (const [d, ids] of Object.entries(byDate)) out[d] = ids.size;
+  return out;
+}
+
+function normalizeDailyStudyRecord(rec) {
+  if (!rec || !/^\d{4}-\d{2}-\d{2}$/.test(String(rec.date || ''))) return null;
+  const num = v => Math.max(0, Math.floor(Number(v) || 0));
+  return {
+    date: String(rec.date),
+    studied: num(rec.studied != null ? rec.studied : rec.count),
+    correct: num(rec.correct),
+    newCount: num(rec.newCount),
+    reviewCount: num(rec.reviewCount),
+    modes: rec.modes && typeof rec.modes === 'object' ? { ...rec.modes } : {},
+    migrated: !!rec.migrated,
+    updatedAt: rec.updatedAt || '',
+  };
+}
+
+async function loadDailyStudyHistory() {
+  state.dailyStudy = {};
+  const rows = await dbGetAll(STORE_S);
+  for (const row of rows) {
+    const rec = normalizeDailyStudyRecord(row);
+    if (rec) state.dailyStudy[rec.date] = rec;
+  }
+
+  const derived = deriveDailyStudyCountsFromProgress();
+  const additions = [];
+  for (const [date, studied] of Object.entries(derived)) {
+    if (state.dailyStudy[date]) continue;
+    const rec = {
+      date, studied, correct: 0, newCount: 0, reviewCount: 0,
+      modes: {}, migrated: true, updatedAt: new Date().toISOString(),
+    };
+    state.dailyStudy[date] = rec;
+    additions.push(rec);
+  }
+  if (additions.length > 0) {
+    await new Promise((resolve, reject) => {
+      const t = db.transaction(STORE_S, 'readwrite');
+      t.onerror = () => reject(t.error);
+      t.oncomplete = resolve;
+      const store = t.objectStore(STORE_S);
+      for (const rec of additions) store.put(rec);
+    });
+  }
+}
+
+async function recordDailyStudy({ allCorrect, hadNew, mode }) {
+  const today = dateKey();
+  let rec = normalizeDailyStudyRecord(state.dailyStudy[today]) || {
+    date: today, studied: 0, correct: 0, newCount: 0, reviewCount: 0,
+    modes: {}, migrated: false, updatedAt: '',
+  };
+  rec.studied += 1;
+  if (allCorrect) rec.correct += 1;
+  if (hadNew) rec.newCount += 1; else rec.reviewCount += 1;
+  const modeKey = ['review', 'new', 'mixed', 'wrong'].includes(mode) ? mode : 'other';
+  rec.modes[modeKey] = Math.max(0, Math.floor(Number(rec.modes[modeKey]) || 0)) + 1;
+  rec.updatedAt = new Date().toISOString();
+  state.dailyStudy[today] = rec;
+  await dbPut(STORE_S, rec);
+}
+
+async function replaceDailyStudyHistory(records) {
+  const normalized = [];
+  for (const row of (Array.isArray(records) ? records : [])) {
+    const rec = normalizeDailyStudyRecord(row);
+    if (rec) normalized.push(rec);
+  }
+  await new Promise((resolve, reject) => {
+    const t = db.transaction(STORE_S, 'readwrite');
+    t.onerror = () => reject(t.error);
+    t.oncomplete = resolve;
+    const store = t.objectStore(STORE_S);
+    store.clear();
+    for (const rec of normalized) store.put(rec);
+  });
+  await loadDailyStudyHistory();
 }
 
 function applyTheme() {
@@ -1282,16 +1478,27 @@ function showView(name) {
 // HOME view
 // ============================================
 function getDeckCounts(catFilter) {
-  let due = 0, newq = 0;
+  const reviewIds = new Set();
+  const newIds = new Set();
+  const reinforcementIds = new Set();
+  const totalIds = new Set();
   for (const q of state.questions) {
     if (catFilter !== 'all' && q.category !== catFilter) continue;
     const states = getBlankStates(q);
     const hasDue = states.some(s => s.st === 'due');
     const hasNew = states.some(s => s.st === 'new');
-    if (hasDue) due++;
-    else if (hasNew) newq++;
+    const hasReinforcement = states.some(isReinforcementBlank);
+    if (hasDue || hasReinforcement) reviewIds.add(q.id);
+    if (hasNew) newIds.add(q.id);
+    if (hasReinforcement) reinforcementIds.add(q.id);
+    if (hasDue || hasNew || hasReinforcement) totalIds.add(q.id);
   }
-  return { due, newq };
+  return {
+    due: reviewIds.size,
+    newq: newIds.size,
+    reinforce: reinforcementIds.size,
+    total: totalIds.size,
+  };
 }
 
 function getWrongCount(catFilter) {
@@ -1299,7 +1506,7 @@ function getWrongCount(catFilter) {
   for (const q of state.questions) {
     if (catFilter !== 'all' && q.category !== catFilter) continue;
     const states = getBlankStates(q);
-    if (states.some(s => s.prog && !s.prog.mastered && s.prog.lapses >= 1 && s.prog.interval < 14)) n++;
+    if (states.some(s => s.prog && s.st !== 'mastered' && s.prog.lapses >= 1 && s.prog.interval < 14)) n++;
   }
   return n;
 }
@@ -1310,10 +1517,10 @@ function renderHome() {
     c.classList.toggle('active', c.dataset.cat === state.selectedCat);
   });
   // Counts
-  const { due, newq } = getDeckCounts(state.selectedCat);
+  const { due, newq, reinforce, total } = getDeckCounts(state.selectedCat);
   document.getElementById('num-due').textContent = due;
   document.getElementById('num-new').textContent = newq;
-  const heroTotal = due + newq;
+  const heroTotal = total;
   const heroEl = document.getElementById('hero-total');
   if (heroEl) heroEl.textContent = heroTotal;
 
@@ -1321,10 +1528,10 @@ function renderHome() {
   document.getElementById('num-streak').textContent = computeStreak();
 
   // Sub labels
-  document.getElementById('btn-review-sub').textContent = `期日が来た問題 (${due}問)`;
-  document.getElementById('btn-new-sub').textContent = `未学習の問題 (${newq}問)`;
+  document.getElementById('btn-review-sub').textContent = `期日・3回正解前の問題 (${due}問)`;
+  document.getElementById('btn-new-sub').textContent = `未学習${newq}問 + 定着中${reinforce}問`;
   const wrongN = getWrongCount(state.selectedCat);
-  document.getElementById('btn-wrong-sub').textContent = `直近で × にした問題 (${wrongN}問)`;
+  document.getElementById('btn-wrong-sub').textContent = `誤答${wrongN}問 + 定着中${reinforce}問`;
 
   // Cat stats line
   const cs = document.getElementById('cat-stats');
@@ -1332,7 +1539,7 @@ function renderHome() {
     const lines = ['common','solution','engineering'].map(c => {
       const cnt = state.questions.filter(q => q.category === c).length;
       const dc = getDeckCounts(c);
-      return `<span>${CATS[c]} ${cnt}問 (本日${dc.due+dc.newq})</span>`;
+      return `<span>${CATS[c]} ${cnt}問 (対象${dc.total})</span>`;
     });
     cs.innerHTML = lines.join('・');
   } else {
@@ -1369,14 +1576,14 @@ function computeStreak() {
   let cur = startOfDay();
   // If today not present, streak starts from yesterday backwards.
   while (true) {
-    const k = cur.toISOString().slice(0,10);
+    const k = dateKey(cur);
     if (dates.has(k)) {
       streak++;
       cur.setDate(cur.getDate() - 1);
     } else if (streak === 0) {
       // allow today not to break streak -> roll back once
       cur.setDate(cur.getDate() - 1);
-      const k2 = cur.toISOString().slice(0,10);
+      const k2 = dateKey(cur);
       if (dates.has(k2)) { streak++; cur.setDate(cur.getDate() - 1); }
       else break;
     } else {
@@ -1389,8 +1596,18 @@ function computeStreak() {
 // ============================================
 // Build study decks
 // ============================================
+function uniqueQuestions(items) {
+  const seen = new Set();
+  const out = [];
+  for (const q of items) {
+    if (!q || seen.has(q.id)) continue;
+    seen.add(q.id);
+    out.push(q);
+  }
+  return out;
+}
+
 function buildDeck(mode) {
-  const today = startOfDay();
   const cat = state.selectedCat;
   const size = state.selectedSize;
   const newCap = Math.max(0, state.settings.newPerDay - state.todaySeen.new);
@@ -1401,23 +1618,25 @@ function buildDeck(mode) {
   const dueList = [];
   const newList = [];
   const wrongList = [];
+  const reinforcementList = [];
 
-  // 各問題の穴状態で分類: dueな穴があれば復習、無くてnewな穴があれば新規
-  const earliestDue = {};  // ソート用: 問題内で最も早いdue穴の期日
+  // 正解1～2回の「定着中」は全モード共通の優先枠として扱う。
+  const earliestDue = {};
   for (const q of state.questions) {
     if (!filterCat(q)) continue;
     const states = getBlankStates(q);
     const hasDue = states.some(s => s.st === 'due');
     const hasNew = states.some(s => s.st === 'new');
-    const hasWrong = states.some(s => s.prog && !s.prog.mastered && s.prog.lapses >= 1 && s.prog.interval < 14);
+    const hasWrong = states.some(s => s.prog && s.st !== 'mastered' && s.prog.lapses >= 1 && s.prog.interval < 14);
+    const hasReinforcement = states.some(isReinforcementBlank);
     if (hasDue) {
       dueList.push(q);
       const dues = states.filter(s => s.st === 'due' && s.prog).map(s => new Date(s.prog.due).getTime());
       earliestDue[q.id] = dues.length ? Math.min(...dues) : 0;
-    } else if (hasNew) {
-      newList.push(q);
     }
+    if (hasNew) newList.push(q);
     if (hasWrong) wrongList.push(q);
+    if (hasReinforcement) reinforcementList.push(q);
   }
 
   // Sort due by oldest due first, then importance desc
@@ -1433,25 +1652,46 @@ function buildDeck(mode) {
     return (a.createdAt || '').localeCompare(b.createdAt || '');
   });
   // Sort wrong by total lapses across blanks desc
-  const totalLapses = (q) => getBlankStates(q).reduce((s, x) => s + (x.prog ? x.prog.lapses : 0), 0);
+  const totalLapses = (q) => getBlankStates(q).reduce((sum, x) => sum + (x.prog ? x.prog.lapses : 0), 0);
   wrongList.sort((a, b) => totalLapses(b) - totalLapses(a));
+  // 定着中は正解回数が少ない問題を先にし、同数なら前回学習が古いものを優先する。
+  const reinforcementScore = (q) => {
+    const ss = getBlankStates(q).filter(isReinforcementBlank);
+    const minCorrect = ss.length ? Math.min(...ss.map(x => x.correctCount)) : MASTER_CORRECT_COUNT;
+    const oldest = ss.map(x => x.prog && x.prog.lastReviewed ? new Date(x.prog.lastReviewed).getTime() : 0);
+    return [minCorrect, oldest.length ? Math.min(...oldest) : 0];
+  };
+  reinforcementList.sort((a, b) => {
+    const aa = reinforcementScore(a), bb = reinforcementScore(b);
+    return aa[0] - bb[0] || aa[1] - bb[1];
+  });
+
+  const reinforcementIds = new Set(reinforcementList.map(q => q.id));
+  const dueOnly = dueList.filter(q => !reinforcementIds.has(q.id));
+  const newOnly = newList.filter(q => !reinforcementIds.has(q.id));
+  const wrongOnly = wrongList.filter(q => !reinforcementIds.has(q.id));
+  const reinforce = shuffle(reinforcementList);
 
   let deck = [];
   if (mode === 'review') {
-    deck = shuffle(dueList.slice(0, revCap));
+    deck = uniqueQuestions([...reinforce, ...shuffle(dueOnly.slice(0, revCap))]);
   } else if (mode === 'new') {
-    deck = shuffle(newList.slice(0, newCap));
+    deck = uniqueQuestions([...reinforce, ...shuffle(newOnly.slice(0, newCap))]);
   } else if (mode === 'wrong') {
-    deck = shuffle(wrongList);
+    deck = uniqueQuestions([...reinforce, ...shuffle(wrongOnly)]);
   } else if (mode === 'mixed') {
-    // Interleave new + due according to mixRatio
-    const [nr, rr] = state.settings.mixRatio.split(':').map(Number);
-    const target = size > 0 ? size : (dueList.length + newList.length);
-    const nN = Math.min(newList.length, newCap, Math.floor(target * nr / (nr + rr)));
-    const rN = Math.min(dueList.length, revCap, target - nN);
-    const news = shuffle(newList.slice(0, nN));
-    const revs = shuffle(dueList.slice(0, rN));
-    deck = interleave(revs, news);
+    // 定着中を先に確保し、残枠へ従来どおり新規・復習を指定比率で混ぜる。
+    const [nrRaw, rrRaw] = state.settings.mixRatio.split(':').map(Number);
+    const nr = Number.isFinite(nrRaw) && nrRaw >= 0 ? nrRaw : 3;
+    const rr = Number.isFinite(rrRaw) && rrRaw >= 0 ? rrRaw : 7;
+    const ratioTotal = Math.max(1, nr + rr);
+    const target = size > 0 ? size : (reinforce.length + dueOnly.length + newOnly.length);
+    const remaining = Math.max(0, target - reinforce.length);
+    const nN = Math.min(newOnly.length, newCap, Math.floor(remaining * nr / ratioTotal));
+    const rN = Math.min(dueOnly.length, revCap, remaining - nN);
+    const news = shuffle(newOnly.slice(0, nN));
+    const revs = shuffle(dueOnly.slice(0, rN));
+    deck = uniqueQuestions([...reinforce, ...interleave(revs, news)]);
   }
   if (size > 0 && deck.length > size) deck = deck.slice(0, size);
   return deck;
@@ -1511,7 +1751,7 @@ function renderStudy() {
   if (q.author) meta.push(`<span class="meta-author">作:${escapeHtml(q.author)}</span>`);
   document.getElementById('study-meta').innerHTML = meta.join(' ');
 
-  document.getElementById('study-question').innerHTML = renderBlanks(q.question);
+  document.getElementById('study-question').innerHTML = renderStudyQuestion(q);
   const ansEl = document.getElementById('study-answer');
   ansEl.innerHTML = renderAnswer(q.answer);
   ansEl.hidden = true;
@@ -1527,10 +1767,9 @@ function renderStudy() {
   document.getElementById('quiz-area').hidden = true;
   document.getElementById('quiz-feedback').hidden = true;
 
-  // この問題で今学習すべき穴(new/due)。mastered/waitは出題しない。
-  // ただし「間違えた問題」モードでは、期日前でも直近の誤答穴を出題対象に含める。
-  const isWrongMode = state.studyStats && state.studyStats.mode === 'wrong';
-  const active = isWrongMode ? qWrongFocusBlanks(q) : qActiveBlanks(q);
+  // モード・期日にかかわらず、累計3回正解前の穴をすべて出題する。
+  // 習得済みの穴は上の問題文へ正解を埋め込み、入力対象から外す。
+  const active = qActiveBlanks(q);
   const hadNew = active.some(s => s.st === 'new');
   state.quiz = {
     q, active, idx: 0, results: [], hadNew,
@@ -1555,7 +1794,7 @@ function renderStudy() {
 
   // TTS auto
   stopTTS();
-  if (state.ttsEnabled) speakNow(q.question);
+  if (state.ttsEnabled) speakNow(studyQuestionSpeechText(q));
   document.getElementById('btn-tts').textContent = state.ttsEnabled ? '🔇' : '🔊';
 }
 
@@ -1569,9 +1808,10 @@ function renderQuizBlank() {
   document.getElementById('quiz-area').hidden = false;
   const labelEl = document.getElementById('quiz-blank-label');
   const totalBlanks = getBlanks(state.quiz.q).length;
+  const masteryLabel = `<span class="qbl-mastery">正解 ${b.correctCount}/${MASTER_CORRECT_COUNT}</span>`;
   labelEl.innerHTML = (totalBlanks > 1)
-    ? `<span class="qbl-num">${escapeHtml(b.label)}</span> の解答 <span class="qbl-count">(${idx + 1}/${active.length})</span>`
-    : `解答を入力`;
+    ? `<span class="qbl-num">${escapeHtml(b.label)}</span> の解答 <span class="qbl-count">(${idx + 1}/${active.length})</span>${masteryLabel}`
+    : `解答を入力 ${masteryLabel}`;
   const input = document.getElementById('quiz-input');
   input.value = '';
   input.readOnly = false;
@@ -1609,8 +1849,10 @@ function judgeQuizBlank() {
   const fb = document.getElementById('quiz-feedback');
   fb.hidden = false;
   fb.className = 'quiz-feedback ' + (correct ? 'fb-correct' : 'fb-incorrect');
+  const nextCorrectCount = Math.min(MASTER_CORRECT_COUNT, b.correctCount + 1);
   fb.innerHTML = correct
     ? `<span class="fb-mark">✓</span> 正解 <span class="fb-time">${elapsedSec.toFixed(1)}秒</span>`
+      + ` <span class="fb-progress">${nextCorrectCount}/${MASTER_CORRECT_COUNT}</span>`
     : `<span class="fb-mark">✗</span> 不正解　<span class="fb-correct-ans">正解: ${escapeHtml(b.answer)}</span>`
       + ` <button class="fb-override" id="fb-override">やっぱり正解だった</button>`;
 
@@ -1621,7 +1863,7 @@ function judgeQuizBlank() {
       input.classList.remove('incorrect');
       input.classList.add('correct');
       fb.className = 'quiz-feedback fb-correct';
-      fb.innerHTML = `<span class="fb-mark">✓</span> 正解にしました`;
+      fb.innerHTML = `<span class="fb-mark">✓</span> 正解にしました <span class="fb-progress">${nextCorrectCount}/${MASTER_CORRECT_COUNT}</span>`;
     });
   }
 
@@ -1641,15 +1883,23 @@ async function commitBlank(idx) {
   const b = state.quiz.active[idx];
   const key = b.key;
   let bp = state.progress[key] || newProgress(key);
+  normalizeProgressMastery(bp);
+  const wasMastered = bp.mastered;
+  const beforeCorrectCount = bp.correctCount;
   const rating = rateBlankAuto(r.correct, r.elapsedSec);
   bp = applySM2(bp, rating);
-  // 連続高速正解の更新と習得卒業
+
+  // 正解速度はSM-2評価用に残すが、習得は速度を問わず累計正解数で判定する。
   if (r.correct && r.elapsedSec <= BLANK_FAST_SEC) bp.fastStreak = (bp.fastStreak || 0) + 1;
   else bp.fastStreak = 0;
-  if (bp.fastStreak >= MASTER_STREAK) {
-    if (!bp.mastered) state.quiz.masteredNow.push(b.label || (b.i + 1));
+  bp.correctCount = r.correct
+    ? Math.min(MASTER_CORRECT_COUNT, beforeCorrectCount + 1)
+    : beforeCorrectCount;
+  if (bp.correctCount >= MASTER_CORRECT_COUNT) {
+    if (!wasMastered) state.quiz.masteredNow.push(b.label || (b.i + 1));
     bp.mastered = true;
   }
+  b.correctCount = bp.correctCount;
   state.progress[key] = bp;
   await dbPut(STORE_P, bp);
 }
@@ -1676,9 +1926,12 @@ async function finishQuizQuestion() {
   const correctCount = results.filter(r => r && r.correct).length;
   const allCorrect = correctCount === active.length;
 
+  // 日付をまたいでアプリを開いたままでも、完了した日の記録へ正しく加算する。
+  if (state.todayKey !== dateKey()) await resetTodayIfNeeded();
   // 日次カウンタは問題ごとに1回(穴数では数えない)
   if (hadNew) await bumpTodayCounter('new');
   else await bumpTodayCounter('rev');
+  await recordDailyStudy({ allCorrect, hadNew, mode: state.studyStats && state.studyStats.mode });
 
   // セッション統計(問題単位)
   state.studyStats.total += 1;
@@ -1690,7 +1943,7 @@ async function finishQuizQuestion() {
   const head = active.length > 1 ? `${active.length}問中 ${correctCount}問正解` : (allCorrect ? '正解' : '不正解');
   let summary = `<div class="quiz-summary ${allCorrect ? 'all-ok' : 'some-ng'}">${head}</div>`;
   if (masteredNow && masteredNow.length) {
-    summary += `<div class="quiz-mastered">🎓 ${masteredNow.length}個の穴を習得（以後出題されません）</div>`;
+    summary += `<div class="quiz-mastered">🎓 ${masteredNow.length}個の穴を習得（3回正解。次回から問題文に正解を表示）</div>`;
   }
   // 残りの穴状況
   const ratio = masteryRatio(q);
@@ -1754,7 +2007,7 @@ function toggleTTS() {
   if (state.ttsEnabled) {
     const q = state.studyDeck[state.studyIdx];
     const ansVisible = !document.getElementById('study-answer').hidden;
-    speakNow(ansVisible ? q.answer : q.question);
+    speakNow(ansVisible ? q.answer : studyQuestionSpeechText(q));
   } else {
     stopTTS();
   }
@@ -1966,6 +2219,51 @@ async function deleteEditor() {
 // ============================================
 // STATS view
 // ============================================
+function renderDailyStudyTrend() {
+  const el = document.getElementById('daily-study-trend');
+  if (!el) return;
+  const now = startOfDay();
+  const series = [];
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const key = dateKey(d);
+    const rec = state.dailyStudy[key];
+    series.push({
+      key,
+      label: `${d.getMonth() + 1}/${d.getDate()}`,
+      count: rec ? Math.max(0, Number(rec.studied) || 0) : 0,
+      migrated: !!(rec && rec.migrated),
+    });
+  }
+  const max = Math.max(1, ...series.map(x => x.count));
+  const today = series[series.length - 1].count;
+  const last7 = series.slice(-7);
+  const average7 = last7.reduce((sum, x) => sum + x.count, 0) / 7;
+  const total30 = series.reduce((sum, x) => sum + x.count, 0);
+  const best = Math.max(...series.map(x => x.count));
+  const bars = series.map((x, i) => {
+    const height = x.count > 0 ? Math.max(5, Math.round(x.count / max * 100)) : 0;
+    const showLabel = i === 0 || i === series.length - 1 || i % 5 === 0;
+    return `<div class="daily-trend-day" title="${x.key}: ${x.count}問" aria-label="${x.key} ${x.count}問">
+      <div class="daily-trend-value">${x.count || ''}</div>
+      <div class="daily-trend-bar-track"><div class="daily-trend-bar" style="height:${height}%"></div></div>
+      <div class="daily-trend-label">${showLabel ? x.label : ''}</div>
+    </div>`;
+  }).join('');
+  const hasMigrated = series.some(x => x.migrated);
+  el.innerHTML = `<div class="daily-trend-summary">
+      <div><span>今日</span><strong>${today}</strong><small>問</small></div>
+      <div><span>7日平均</span><strong>${average7.toFixed(1)}</strong><small>問/日</small></div>
+      <div><span>30日合計</span><strong>${total30}</strong><small>問</small></div>
+      <div><span>最多</span><strong>${best}</strong><small>問/日</small></div>
+    </div>
+    <div class="daily-trend-scroll" tabindex="0" aria-label="直近30日の日別学習問題数。横にスクロールできます">
+      <div class="daily-trend-chart">${bars}</div>
+    </div>
+    <p class="daily-trend-note">完了した問題を1回ごとに集計します。${hasMigrated ? '更新前の期間は、既存の穴別履歴から同じ問題を日ごとに重複除去して復元しています。' : ''}</p>`;
+}
+
 function renderStats() {
   let total = state.questions.length;
   let mastered = 0, review = 0, learning = 0, newq = 0, leech = 0;
@@ -1984,7 +2282,9 @@ function renderStats() {
   document.getElementById('stat-newq').textContent = newq;
   document.getElementById('stat-leech').textContent = leech;
 
-  // Heatmap (last 30 days)
+  renderDailyStudyTrend();
+
+  // Heatmap (last 30 days / blank answers)
   const counts = {};
   for (const qid in state.progress) {
     for (const h of (state.progress[qid].history || [])) {
@@ -1995,14 +2295,14 @@ function renderStats() {
   const now = startOfDay();
   for (let i = 29; i >= 0; i--) {
     const d = new Date(now); d.setDate(d.getDate() - i);
-    const k = d.toISOString().slice(0, 10);
+    const k = dateKey(d);
     const n = counts[k] || 0;
     let lvl = 0;
     if (n >= 30) lvl = 4;
     else if (n >= 15) lvl = 3;
     else if (n >= 5) lvl = 2;
     else if (n >= 1) lvl = 1;
-    cells.push(`<div class="heat-cell" data-level="${lvl}" title="${k}: ${n}回"></div>`);
+    cells.push(`<div class="heat-cell" data-level="${lvl}" title="${k}: 穴回答 ${n}回"></div>`);
   }
   document.getElementById('heatmap').innerHTML = cells.join('');
 
@@ -2096,7 +2396,7 @@ const ICLOUD_FILENAME = 'shoshin-study-sync.json';
 
 async function iCloudSave() {
   const data = {
-    version: 2,
+    version: 3,
     type: 'icloud-sync',
     savedAt: new Date().toISOString(),
     deviceHint: navigator.userAgent.includes('iPhone') ? 'iPhone'
@@ -2104,6 +2404,7 @@ async function iCloudSave() {
     settings: state.settings,
     questions: state.questions,
     progress: Object.values(state.progress),
+    sessions: Object.values(state.dailyStudy),
   };
   // iPhoneのSafariではdownloadリンクがファイルアプリに保存される
   const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
@@ -2151,6 +2452,13 @@ async function iCloudLoad(file) {
     });
     state.progress = {};
     for (const p of progArr) state.progress[p.questionId] = p;
+    await migrateProgressToPerBlank();
+    await migrateProgressCorrectCounts();
+
+    const sessionRaw = Array.isArray(data.sessions)
+      ? data.sessions
+      : Object.values(data.sessions || data.dailyStudy || {});
+    await replaceDailyStudyHistory(sessionRaw);
 
     // settings があれば上書き
     if (data.settings) {
@@ -2158,7 +2466,7 @@ async function iCloudLoad(file) {
       await saveSettings();
     }
 
-    toast(`☁️ 読み込み完了: ${state.questions.length}問 / 進捗${progArr.length}件`);
+    toast(`☁️ 読み込み完了: ${state.questions.length}問 / 進捗${Object.keys(state.progress).length}件`);
     applyTheme(); applyFontSize();
     renderHome(); renderList(); renderStats(); renderSettings();
   } catch (e) {
@@ -2169,12 +2477,13 @@ async function iCloudLoad(file) {
 
 async function exportAll() {
   const data = {
-    version: 2,
+    version: 3,
     type: 'full',
     exportedAt: new Date().toISOString(),
     settings: state.settings,
     questions: state.questions,
     progress: state.progress,
+    sessions: state.dailyStudy,
   };
   downloadJSON(data, `shoshin-shiken-full-${dateKey()}.json`);
   toast('全データをエクスポートしました');
@@ -2315,11 +2624,21 @@ async function importJSON(file, full) {
       // Replace progress
       await dbClear(STORE_P);
       state.progress = {};
-      for (const k in data.progress) {
-        const p = data.progress[k];
+      const importedProgress = Array.isArray(data.progress)
+        ? data.progress
+        : Object.values(data.progress || {});
+      for (const p of importedProgress) {
+        if (!p || !p.questionId) continue;
         await dbPut(STORE_P, p);
         state.progress[p.questionId] = p;
       }
+      await migrateProgressToPerBlank();
+      await migrateProgressCorrectCounts();
+
+      const sessionRaw = Array.isArray(data.sessions)
+        ? data.sessions
+        : Object.values(data.sessions || data.dailyStudy || {});
+      await replaceDailyStudyHistory(sessionRaw);
     }
     if (full && data.settings) {
       state.settings = { ...state.settings, ...data.settings };
@@ -2560,11 +2879,12 @@ function parseDelim(text, sep) {
 }
 
 async function resetProgress() {
-  await dbClear(STORE_P);
+  await Promise.all([dbClear(STORE_P), dbClear(STORE_S)]);
   state.progress = {};
+  state.dailyStudy = {};
   await metaSet('todayCounters', { date: state.todayKey, new: 0, rev: 0 });
   state.todaySeen = { new: 0, rev: 0 };
-  toast('進捗をリセットしました');
+  toast('進捗と日別学習記録をリセットしました');
   renderHome(); renderList(); renderStats();
 }
 
@@ -2580,6 +2900,7 @@ async function resetAll() {
   clearSourceAssetUrlCache();
   state.questions = [];
   state.progress = {};
+  state.dailyStudy = {};
   state.sourceIndex = emptySourceIndex();
   state.settings = {
     examDate: '', newPerDay: 10, revPerDay: 100,
@@ -2935,7 +3256,7 @@ function bindEvents() {
 
   // Settings: reset
   document.getElementById('btn-reset-progress').addEventListener('click', async () => {
-    const ok = await confirm('全ての学習進捗(SM-2の状態・履歴・本日のカウンタ)をリセットします。\n問題自体は残ります。よろしいですか?');
+    const ok = await confirm('全ての学習進捗(SM-2の状態・履歴・本日のカウンタ・日別学習数)をリセットします。\n問題自体は残ります。よろしいですか?');
     if (!ok) return;
     await resetProgress();
   });

@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#08090F" media="(prefers-color-scheme: dark)">
 <title>昇進試験 学習</title>
 <link rel="icon" type="image/png" href="icon-192.png">
-<link rel="stylesheet" href="styles.css">
+<link rel="stylesheet" href="styles.css?v=2.4.0">
 </head>
 <body>
 
@@ -217,7 +217,7 @@
           <option value="new">未学習</option>
           <option value="learning">学習中</option>
           <option value="review">復習中</option>
-          <option value="mastered">習得済み(21日+)</option>
+          <option value="mastered">習得済み（各穴3回正解）</option>
           <option value="leech">苦手(失敗多)</option>
         </select>
         <select id="list-sort" class="select-mini">
@@ -322,7 +322,11 @@
         <div class="stat-card"><div class="stat-num" id="stat-leech">0</div><div class="stat-label">苦手</div></div>
       </div>
       <div class="stats-section">
-        <h3>直近30日の学習量</h3>
+        <h3>1日で勉強した問題数の推移</h3>
+        <div id="daily-study-trend" class="daily-study-trend"></div>
+      </div>
+      <div class="stats-section">
+        <h3>直近30日の穴回答量</h3>
         <div id="heatmap" class="heatmap"></div>
       </div>
       <div class="stats-section">
@@ -506,7 +510,7 @@
 
       <div class="settings-section">
         <h3>危険な操作</h3>
-        <button class="btn-danger" id="btn-reset-progress">学習進捗のみリセット</button>
+        <button class="btn-danger" id="btn-reset-progress">学習進捗・日別記録をリセット</button>
         <button class="btn-danger" id="btn-reset-all">全データを削除</button>
       </div>
 
@@ -519,7 +523,7 @@
       <div class="settings-section about">
         <h3>このアプリ</h3>
         <p>SM-2間隔反復・アクティブリコール・インターリービング・穴埋め式を採用。完全オフライン動作・無料。</p>
-        <p class="hint">v2.3.0 / Build 2026.07 (ローカルPDFページ画像・座標ハイライト)</p>
+        <p class="hint">v2.4.0 / Build 2026.07 (3回正解定着・日別学習推移・ローカルPDF出典)</p>
       </div>
     </div>
   </section>
@@ -540,6 +544,6 @@
   </div>
 </div>
 
-<script src="app.js?v=3.2.0"></script>
+<script src="app.js?v=2.4.0"></script>
 </body>
 </html>
