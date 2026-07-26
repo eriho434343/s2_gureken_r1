@@ -655,6 +655,17 @@ input:focus, textarea:focus, select:focus {
   font-weight: 600;
   letter-spacing: 0.02em;
 }
+.study-meta .meta-round {
+  display: inline-block;
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--violet) 32%, var(--border));
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--violet) 9%, var(--bg-1));
+  color: var(--violet);
+  font-weight: 700;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.01em;
+}
 .study-meta .meta-imp { color: var(--accent); margin-right: 2px; letter-spacing: -0.05em; }
 .study-meta .meta-author {
   display: inline-block;
@@ -1837,27 +1848,6 @@ body.source-viewer-open { overflow: hidden; }
   .source-image-viewer-title strong { max-width: 190px; }
 }
 
-.source-excerpt {
-  margin-top: 10px;
-  padding: 12px 13px;
-  border-left: 3px solid var(--primary);
-  border-radius: 0 var(--r-sm) var(--r-sm) 0;
-  background: var(--bg-2);
-  color: var(--text-muted);
-  font-size: calc(12.5px * var(--font-q-mult));
-  line-height: 1.75;
-  white-space: pre-wrap;
-  word-break: break-word;
-}
-.source-excerpt mark {
-  padding: 1px 3px;
-  border-radius: 3px;
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-weight: 750;
-  box-decoration-break: clone;
-  -webkit-box-decoration-break: clone;
-}
 .source-note {
   margin: 10px 1px 0;
   color: var(--text-faint);
@@ -1890,20 +1880,31 @@ body.source-viewer-open { overflow: hidden; }
 
 @media (min-width: 768px) {
   .source-panel { padding: 19px 18px; }
-  .source-excerpt { font-size: calc(13px * var(--font-q-mult)); }
 }
 
 @media (max-width: 420px) {
   .source-index-actions { grid-template-columns: 1fr; }
 }
 
-/* ===== v2.4: 3回正解による穴の定着表示 ===== */
+/* ===== v2.5: 3回正解・穴/問題の周回表示 ===== */
 .blank.blank-filled {
   min-width: 0;
   background: color-mix(in srgb, var(--good) 15%, var(--bg-1));
   color: var(--good);
   border-bottom-color: var(--good);
   box-shadow: 0 1px 6px color-mix(in srgb, var(--good) 18%, transparent);
+}
+.quiz-blank-label .qbl-round {
+  display: inline-block;
+  margin-left: 8px;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--violet) 12%, var(--bg-1));
+  color: var(--violet);
+  font-size: 10.5px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  vertical-align: 0.05em;
 }
 .quiz-blank-label .qbl-mastery {
   display: inline-block;
@@ -1918,6 +1919,14 @@ body.source-viewer-open { overflow: hidden; }
   font-variant-numeric: tabular-nums;
   vertical-align: 0.05em;
 }
+.quiz-question-round {
+  margin-top: 8px;
+  color: var(--violet);
+  font-size: 12px;
+  font-weight: 750;
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
 .quiz-feedback .fb-progress {
   display: inline-block;
   margin-left: 6px;
@@ -1930,7 +1939,7 @@ body.source-viewer-open { overflow: hidden; }
   font-variant-numeric: tabular-nums;
 }
 
-/* ===== v2.4: 日別学習問題数 ===== */
+/* ===== v2.5: 日別学習問題数 ===== */
 .daily-study-trend {
   background: var(--bg-1);
   border: 1px solid var(--border);

@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#08090F" media="(prefers-color-scheme: dark)">
 <title>昇進試験 学習</title>
 <link rel="icon" type="image/png" href="icon-192.png">
-<link rel="stylesheet" href="styles.css?v=2.4.0">
+<link rel="stylesheet" href="styles.css?v=2.6.0">
 </head>
 <body>
 
@@ -444,7 +444,7 @@
           </div>
           <ul class="sync-notes">
             <li>CSVの内容にアプリを完全一致(追加・更新・削除)</li>
-            <li>問題文・解答を変えた行は履歴リセット(新規扱い)</li>
+            <li>問題文・解答を変えた行は問題の周回数をリセット。変更していない穴の履歴は保持</li>
             <li>タグ・重要度だけの変更は学習履歴を保持</li>
             <li>CSVから消した問題はアプリからも削除</li>
           </ul>
@@ -455,7 +455,7 @@
 
       <div class="settings-section">
         <h3>ローカル出典データ</h3>
-        <p class="hint">共通・ソリューション資料から作成した本文抜粋と必要なPDFページ画像を、この端末のIndexedDBだけに保存します。GitHub、通常バックアップ、iCloud同期には含めません。</p>
+        <p class="hint">共通・ソリューション・法人営業資料から作成したPDFページ画像とハイライト座標を、この端末のIndexedDBだけに保存します。GitHub、通常バックアップ、iCloud同期には含めません。</p>
         <div class="source-index-card">
           <div class="source-index-status" id="source-index-status">
             <strong>未読み込み</strong><span>出典データはこの端末にだけ保存されます</span>
@@ -467,8 +467,8 @@
           <ul class="sync-notes">
             <li>全ての穴を回答した後だけ、解答の下に出典を表示</li>
             <li>文字の出典より上に該当ページ画像を表示し、タップで拡大</li>
-            <li>特定できた解答箇所は、ページ画像と原文の両方でハイライト</li>
-            <li>本文一致が弱い問題は、誤表示を避けて出典名のみ表示</li>
+            <li>特定できた穴抜き解答箇所は、ページ画像上だけに黄色の枠で表示</li>
+            <li>該当ページを安全に特定できない問題は、誤表示を避けて文字の出典情報だけを表示</li>
           </ul>
         </div>
         <input type="file" id="file-import-source-index" accept="application/json,.json" hidden>
@@ -523,7 +523,7 @@
       <div class="settings-section about">
         <h3>このアプリ</h3>
         <p>SM-2間隔反復・アクティブリコール・インターリービング・穴埋め式を採用。完全オフライン動作・無料。</p>
-        <p class="hint">v2.4.0 / Build 2026.07 (3回正解定着・日別学習推移・ローカルPDF出典)</p>
+        <p class="hint">v2.6.0 / Build 2026.07 (少ない出題回数を優先・同数ランダム・穴／問題周回・3回正解定着・日別推移・ローカルPDF出典)</p>
       </div>
     </div>
   </section>
@@ -544,6 +544,6 @@
   </div>
 </div>
 
-<script src="app.js?v=2.4.0"></script>
+<script src="app.js?v=2.6.0"></script>
 </body>
 </html>

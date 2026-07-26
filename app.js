@@ -12,14 +12,15 @@
 // Constants & state
 // ============================================
 const DB_NAME = 'shoshin-shiken';
-const DB_VERSION = 2;
+const DB_VERSION = 3;
 const STORE_Q = 'questions';
 const STORE_P = 'progress';
 const STORE_S = 'sessions';
 const STORE_M = 'meta';
 const STORE_A = 'sourceAssets';
+const STORE_R = 'questionStats';
 
-const APP_VERSION = '2.4.0';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.6.0';  // バージョンが変わっても IndexedDB のデータは保持される
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
 const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
 const SOURCE_INDEX_MAX_BYTES = 64 * 1024 * 1024;
@@ -33,6 +34,7 @@ const CATS = { common: '共通', solution: 'ソリューション', engineering:
 const state = {
   questions: [],          // [{id, category, question, answer, ...}]
   progress: {},           // {questionId: {ease, interval, reps, due, ...}}
+  questionStats: {},      // {questionId: {completedRounds, presentedCount, lastCompleted, contentHash}}
   dailyStudy: {},         // {YYYY-MM-DD: {date, studied, correct, newCount, reviewCount, ...}}
   settings: {
     examDate: '',
@@ -48,6 +50,7 @@ const state = {
   todaySeen: { new: 0, rev: 0 },  // counters reset daily
   studyDeck: [],          // current session queue
   studyIdx: 0,
+  studyPresentedKeys: new Set(), // 同一セッション内の再描画で出題回数を二重加算しない
   studyStats: { again: 0, hard: 0, good: 0, easy: 0, total: 0 },
   selectedCat: 'all',
   selectedSize: 10,
@@ -96,6 +99,9 @@ function openDB() {
       }
       if (!d.objectStoreNames.contains(STORE_A)) {
         d.createObjectStore(STORE_A, { keyPath: 'id' });
+      }
+      if (!d.objectStoreNames.contains(STORE_R)) {
+        d.createObjectStore(STORE_R, { keyPath: 'questionId' });
       }
     };
     req.onsuccess = () => { db = req.result; resolve(db); };
@@ -717,8 +723,8 @@ async function importLocalSourceIndex(file) {
     setSourceIndexData(indexData);
     renderSourceIndexStatus();
     const coverage = sourceCoverageStats();
-    const imageText = coverage.pageImage ? ` / ページ画像${coverage.pageImage}問` : '';
-    toast(`出典データを読み込みました: 抜粋${coverage.excerpt}問 / マーカー${coverage.marked}問${imageText}`);
+    const imageText = coverage.pageImage ? `ページ画像${coverage.pageImage}問` : 'ページ画像なし';
+    toast(`出典データを読み込みました: 照合${coverage.matched}/${coverage.total}問 / ${imageText} / 画像ハイライト${coverage.imageMarked}問`);
   } catch (e) {
     console.error(e);
     toast('出典データの読み込み失敗: ' + e.message);
@@ -758,15 +764,13 @@ function findSourceEntry(q) {
 }
 
 function sourceCoverageStats() {
-  const result = { total: state.questions.length, matched: 0, excerpt: 0, marked: 0, pageImage: 0, imageMarked: 0 };
+  const result = { total: state.questions.length, matched: 0, pageImage: 0, imageMarked: 0 };
   if (!state.sourceIndex.loaded) return result;
   for (const q of state.questions) {
     const entry = findSourceEntry(q);
     if (!entry) continue;
     result.matched++;
     const refs = Array.isArray(entry.references) ? entry.references : [];
-    if (refs.some(ref => ref && ref.excerpt)) result.excerpt++;
-    if (refs.some(ref => ref && Array.isArray(ref.highlights) && ref.highlights.length)) result.marked++;
     if (refs.some(ref => ref && ref.pageImage && ref.pageImage.assetId)) result.pageImage++;
     if (refs.some(ref => ref && ref.pageImage && Array.isArray(ref.pageImage.highlightRects) && ref.pageImage.highlightRects.length)) {
       result.imageMarked++;
@@ -793,43 +797,12 @@ function renderSourceIndexStatus() {
   }
   const pageText = coverage.pageImage
     ? `・ページ画像 ${coverage.pageImage}問(${state.sourceIndex.assetCount}枚)・画像ハイライト ${coverage.imageMarked}問`
-    : '';
+    : '・ページ画像 0問';
   statusEl.className = 'source-index-status loaded';
   statusEl.innerHTML =
     `<strong>読み込み済み</strong>` +
-    `<span>照合 ${coverage.matched}/${coverage.total}問・本文抜粋 ${coverage.excerpt}問・マーカー ${coverage.marked}問${pageText}${escapeHtml(generated)}</span>`;
+    `<span>照合 ${coverage.matched}/${coverage.total}問${pageText}${escapeHtml(generated)}</span>`;
   if (clearBtn) clearBtn.disabled = false;
-}
-
-function escapeRegExp(s) {
-  return String(s).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-}
-
-function highlightSourceExcerpt(text, terms) {
-  const source = String(text || '');
-  const unique = [];
-  const seen = new Set();
-  const sourceLower = source.toLocaleLowerCase('ja-JP');
-  for (const raw of Array.isArray(terms) ? terms : []) {
-    const term = String(raw || '').trim();
-    const key = term.toLocaleLowerCase('ja-JP');
-    if (!term || term.length > 300 || seen.has(key) || !sourceLower.includes(key)) continue;
-    seen.add(key);
-    unique.push(term);
-  }
-  unique.sort((a, b) => b.length - a.length);
-  if (!unique.length) return escapeHtml(source);
-  const re = new RegExp(unique.map(escapeRegExp).join('|'), 'gi');
-  let out = '';
-  let last = 0;
-  source.replace(re, (match, offset) => {
-    out += escapeHtml(source.slice(last, offset));
-    out += `<mark>${escapeHtml(match)}</mark>`;
-    last = offset + match.length;
-    return match;
-  });
-  out += escapeHtml(source.slice(last));
-  return out;
 }
 
 function sourcePercent(value) {
@@ -848,7 +821,7 @@ function sourcePageVisualHtml(ref, documentName) {
   const pageLabel = isRaster ? '該当資料画像' : '該当PDFページ';
   const note = rects.length
     ? '<span class="source-page-key" aria-hidden="true"></span>黄色の枠が穴抜き解答の該当箇所です。'
-    : '画像上の解答位置は安全に特定できなかったため、下の原文マーカーをご確認ください。';
+    : '画像上の解答位置は安全に特定できなかったため、ページ画像のみ表示しています。';
   const alt = `${documentName}${pageNo ? ` PDF p.${pageNo}` : ''} のページ画像`;
   return `<div class="source-page-visual${rects.length ? ' has-marks' : ''}" ` +
     `data-source-asset-id="${escapeHtml(pageImage.assetId)}" ` +
@@ -1035,36 +1008,36 @@ function renderQuestionSources(q) {
   if (!sourceLabel && refs.length === 0) return '';
 
   let body = '';
-  if (sourceLabel) {
-    body += `<div class="source-label"><span>CSV記載</span><div>${escapeHtml(sourceLabel)}</div></div>`;
-  }
 
   if (!state.sourceIndex.loaded) {
-    body += '<p class="source-note">設定でローカル出典データを読み込むと、資料名・ページ・該当本文を表示できます。</p>';
+    body += '<p class="source-note">設定でローカル出典データを読み込むと、該当ページ画像・画像ハイライト・資料名・ページを表示できます。</p>';
   } else if (refs.length > 0) {
     for (const ref of refs) {
       const match = ref.match === 'verified' ? 'verified' : (ref.match === 'inferred' ? 'inferred' : 'citation');
       const badge = match === 'verified' ? '資料内の一致箇所' : (match === 'inferred' ? '資料内の一致候補' : '出典情報のみ');
       const documentName = String(ref.document || '出典資料');
       const page = Number.isInteger(ref.page) && ref.page > 0 ? `<span class="source-page">PDF p.${ref.page}</span>` : '';
+      const visual = sourcePageVisualHtml(ref, documentName);
       body += `<article class="source-ref ${match}">` +
+        visual +
         `<div class="source-ref-head"><span class="source-badge ${match}">${badge}</span>${page}</div>` +
-        `<div class="source-document">${escapeHtml(documentName)}</div>` +
-        sourcePageVisualHtml(ref, documentName);
-      if (ref.excerpt) {
-        body += `<div class="source-excerpt">${highlightSourceExcerpt(ref.excerpt, ref.highlights)}</div>`;
-        if (match === 'inferred') {
-          body += '<p class="source-note">問題文との類似度から抽出した候補です。前後の文脈は元資料で確認してください。</p>';
-        }
-      } else {
-        body += '<p class="source-note">本文の一致箇所を安全に特定できなかったため、資料名とページ情報だけを表示しています。</p>';
+        `<div class="source-document">${escapeHtml(documentName)}</div>`;
+      if (!visual) {
+        body += '<p class="source-note">該当ページを安全に特定できなかったため、資料名とページ情報だけを表示しています。</p>';
+      } else if (match === 'inferred') {
+        body += '<p class="source-note">問題文との類似度から特定したページ候補です。資料全体の文脈も確認してください。</p>';
       }
       body += '</article>';
     }
   } else if (!entry) {
     body += '<p class="source-note">現在の問題内容に一致するローカル索引がありません。問題を編集した場合は、出典データを再作成してください。</p>';
   } else {
-    body += '<p class="source-note">提供資料内で安全に特定できる本文一致が見つからなかったため、CSV記載の出典だけを表示しています。</p>';
+    body += '<p class="source-note">提供資料内で該当ページを安全に特定できなかったため、CSV記載の出典だけを表示しています。</p>';
+  }
+
+  // 文字で表示する出典情報は、必ずページ画像の後ろに置く。
+  if (sourceLabel) {
+    body += `<div class="source-label"><span>CSV記載</span><div>${escapeHtml(sourceLabel)}</div></div>`;
   }
 
   return `<section class="source-panel" aria-label="出典"><h3>出典（ローカル資料）</h3>${body}</section>`;
@@ -1104,6 +1077,226 @@ function masteryRatio(q) {
 }
 
 // ============================================
+// Whole-question round tracking
+// ============================================
+function questionHash(q) {
+  return String((q && q.contentHash) || contentHash(q || {}));
+}
+
+function normalizeQuestionStat(raw, q = null) {
+  if (!raw || !raw.questionId) return null;
+  const completed = Math.max(0, Math.floor(Number(raw.completedRounds) || 0));
+  // v2.5以前には表示回数が無いため、少なくとも完了周回数ぶんは出題済みとして復元する。
+  const presented = Math.max(completed, Math.max(0, Math.floor(Number(raw.presentedCount) || 0)));
+  return {
+    questionId: String(raw.questionId),
+    contentHash: q ? questionHash(q) : String(raw.contentHash || ''),
+    completedRounds: completed,
+    presentedCount: presented,
+    lastCompleted: typeof raw.lastCompleted === 'string' ? raw.lastCompleted : '',
+  };
+}
+
+function completedQuestionRounds(q) {
+  if (!q) return 0;
+  const stat = state.questionStats[q.id];
+  if (!stat || (stat.contentHash && stat.contentHash !== questionHash(q))) return 0;
+  return Math.max(0, Math.floor(Number(stat.completedRounds) || 0));
+}
+
+// 実際に問題画面へ表示した回数。旧データは完了周回数を下限として安全に復元する。
+function presentedQuestionCount(q) {
+  if (!q) return 0;
+  const stat = state.questionStats[q.id];
+  if (!stat || (stat.contentHash && stat.contentHash !== questionHash(q))) return 0;
+  return Math.max(
+    completedQuestionRounds(q),
+    Math.max(0, Math.floor(Number(stat.presentedCount) || 0)),
+  );
+}
+
+function currentQuestionRound(q) {
+  return completedQuestionRounds(q) + 1;
+}
+
+function progressReviewCount(p) {
+  if (!p) return 0;
+  return Math.max(
+    0,
+    Math.floor(Number(p.totalReviews) || 0),
+    Array.isArray(p.history) ? p.history.length : 0,
+  );
+}
+
+function inferQuestionStat(q) {
+  let completedRounds = 0;
+  let lastCompleted = '';
+  for (const s of getBlankStates(q)) {
+    const p = s.prog;
+    completedRounds = Math.max(completedRounds, progressReviewCount(p));
+    if (p && typeof p.lastReviewed === 'string' && p.lastReviewed > lastCompleted) {
+      lastCompleted = p.lastReviewed;
+    }
+  }
+  if (completedRounds <= 0) return null;
+  return {
+    questionId: q.id,
+    contentHash: questionHash(q),
+    completedRounds,
+    presentedCount: completedRounds,
+    lastCompleted,
+  };
+}
+
+async function loadQuestionStats() {
+  const rows = await dbGetAll(STORE_R);
+  state.questionStats = {};
+  for (const raw of rows) {
+    const stat = normalizeQuestionStat(raw);
+    if (stat) state.questionStats[stat.questionId] = stat;
+  }
+}
+
+// v2.4以前には問題単位の周回記録が無かったため、穴ごとのレビュー回数から復元する。
+// 同じ問題の各穴は原則として同じセッションで回答されるため、最大レビュー回数を採用する。
+// v2.5以前の出題回数は記録されていないため、完了周回数を初期値として引き継ぐ。
+async function migrateQuestionStats() {
+  const qById = new Map(state.questions.map(q => [q.id, q]));
+  const puts = [];
+  const dels = [];
+
+  for (const [qid, raw] of Object.entries(state.questionStats)) {
+    const q = qById.get(qid);
+    if (!q || (raw.contentHash && raw.contentHash !== questionHash(q))) {
+      delete state.questionStats[qid];
+      dels.push(qid);
+      continue;
+    }
+    const normalized = normalizeQuestionStat(raw, q);
+    state.questionStats[qid] = normalized;
+    if (JSON.stringify(normalized) !== JSON.stringify(raw)) puts.push(normalized);
+  }
+
+  for (const q of state.questions) {
+    if (state.questionStats[q.id]) continue;
+    const inferred = inferQuestionStat(q);
+    if (!inferred) continue;
+    state.questionStats[q.id] = inferred;
+    puts.push(inferred);
+  }
+
+  if (!puts.length && !dels.length) return;
+  await new Promise((resolve, reject) => {
+    const t = db.transaction(STORE_R, 'readwrite');
+    t.onerror = () => reject(t.error);
+    t.oncomplete = resolve;
+    const s = t.objectStore(STORE_R);
+    for (const id of dels) s.delete(id);
+    for (const stat of puts) s.put(stat);
+  });
+}
+
+async function deleteQuestionStat(questionId) {
+  if (!questionId) return;
+  delete state.questionStats[questionId];
+  await dbDel(STORE_R, questionId);
+}
+
+// 問題追加・変更・削除後に、現在の問題内容と一致しない周回記録だけを削除する。
+async function reconcileQuestionStats() {
+  const valid = new Map(state.questions.map(q => [q.id, questionHash(q)]));
+  const dels = [];
+  for (const [qid, stat] of Object.entries(state.questionStats)) {
+    const hash = valid.get(qid);
+    if (!hash || (stat.contentHash && stat.contentHash !== hash)) {
+      delete state.questionStats[qid];
+      dels.push(qid);
+    } else if (!stat.contentHash) {
+      stat.contentHash = hash;
+      await dbPut(STORE_R, stat);
+    }
+  }
+  if (!dels.length) return;
+  await new Promise((resolve, reject) => {
+    const t = db.transaction(STORE_R, 'readwrite');
+    t.onerror = () => reject(t.error);
+    t.oncomplete = resolve;
+    const s = t.objectStore(STORE_R);
+    for (const id of dels) s.delete(id);
+  });
+}
+
+async function replaceQuestionStats(raw) {
+  const list = Array.isArray(raw) ? raw : Object.values(raw || {});
+  const qById = new Map(state.questions.map(q => [q.id, q]));
+  const records = [];
+  for (const item of list) {
+    if (!item || !item.questionId) continue;
+    const q = qById.get(String(item.questionId));
+    if (!q) continue;
+    const stat = normalizeQuestionStat(item, q);
+    // 内容ハッシュが明示され、現在の問題と異なる記録は復元しない。
+    if (item.contentHash && String(item.contentHash) !== questionHash(q)) continue;
+    records.push(stat);
+  }
+  await new Promise((resolve, reject) => {
+    const t = db.transaction(STORE_R, 'readwrite');
+    t.onerror = () => reject(t.error);
+    t.oncomplete = resolve;
+    const s = t.objectStore(STORE_R);
+    s.clear();
+    for (const stat of records) s.put(stat);
+  });
+  state.questionStats = {};
+  for (const stat of records) state.questionStats[stat.questionId] = stat;
+  await migrateQuestionStats();
+}
+
+function markQuestionPresented(q) {
+  if (!q) return 0;
+  const raw = state.questionStats[q.id];
+  const validRaw = raw && (!raw.contentHash || raw.contentHash === questionHash(q)) ? raw : null;
+  const current = normalizeQuestionStat(validRaw, q) || {
+    questionId: q.id,
+    contentHash: questionHash(q),
+    completedRounds: 0,
+    presentedCount: 0,
+    lastCompleted: '',
+  };
+  const stat = {
+    ...current,
+    contentHash: questionHash(q),
+    presentedCount: Math.max(current.completedRounds, current.presentedCount) + 1,
+  };
+  state.questionStats[q.id] = stat;
+  // 表示を待たせない。IndexedDBへの書込みは開始順に処理され、完了時の保存で同じ値を保持する。
+  dbPut(STORE_R, stat).catch(e => console.error('出題回数を保存できませんでした', e));
+  return stat.presentedCount;
+}
+
+async function completeQuestionRound(q) {
+  if (!q) return 0;
+  if (state.quiz.roundCommitted) return state.quiz.questionRound || completedQuestionRounds(q);
+  const shownRound = Math.max(1, Math.floor(Number(state.quiz.questionRound) || currentQuestionRound(q)));
+  const previous = completedQuestionRounds(q);
+  const completedRounds = Math.max(previous + 1, shownRound);
+  const raw = state.questionStats[q.id];
+  const validRaw = raw && (!raw.contentHash || raw.contentHash === questionHash(q)) ? raw : null;
+  const current = normalizeQuestionStat(validRaw, q);
+  const stat = {
+    questionId: q.id,
+    contentHash: questionHash(q),
+    completedRounds,
+    presentedCount: Math.max(completedRounds, current ? current.presentedCount : 0),
+    lastCompleted: new Date().toISOString(),
+  };
+  state.questionStats[q.id] = stat;
+  await dbPut(STORE_R, stat);
+  state.quiz.roundCommitted = true;
+  return completedRounds;
+}
+
+// ============================================
 // Loading & init
 // ============================================
 async function init() {
@@ -1130,6 +1323,9 @@ async function init() {
   await migrateProgressToPerBlank();
   // 旧版の高速連続正解方式から、累計3回正解方式へ安全に移行する。
   await migrateProgressCorrectCounts();
+  // 問題全体の周回数を読み込み、旧版は穴ごとの履歴から安全に復元する。
+  await loadQuestionStats();
+  await migrateQuestionStats();
   // 日別学習数を読み込み、更新前の履歴は問題単位へ重複除去して復元する。
   await loadDailyStudyHistory();
 
@@ -1607,6 +1803,15 @@ function uniqueQuestions(items) {
   return out;
 }
 
+// 問題単位の出題回数が少ない順。同数は毎回ランダムに並べる。
+// decorate-sort-undecorate方式により、sort比較中に乱数を呼ばず偏りを抑える。
+function prioritizeByFewestPresentations(items) {
+  return uniqueQuestions(items)
+    .map((q, index) => ({ q, count: presentedQuestionCount(q), random: Math.random(), index }))
+    .sort((a, b) => a.count - b.count || a.random - b.random || a.index - b.index)
+    .map(row => row.q);
+}
+
 function buildDeck(mode) {
   const cat = state.selectedCat;
   const size = state.selectedSize;
@@ -1620,8 +1825,7 @@ function buildDeck(mode) {
   const wrongList = [];
   const reinforcementList = [];
 
-  // 正解1～2回の「定着中」は全モード共通の優先枠として扱う。
-  const earliestDue = {};
+  // 正解1～2回の「定着中」は、従来どおり全モードの候補へ必ず加える。
   for (const q of state.questions) {
     if (!filterCat(q)) continue;
     const states = getBlankStates(q);
@@ -1629,58 +1833,28 @@ function buildDeck(mode) {
     const hasNew = states.some(s => s.st === 'new');
     const hasWrong = states.some(s => s.prog && s.st !== 'mastered' && s.prog.lapses >= 1 && s.prog.interval < 14);
     const hasReinforcement = states.some(isReinforcementBlank);
-    if (hasDue) {
-      dueList.push(q);
-      const dues = states.filter(s => s.st === 'due' && s.prog).map(s => new Date(s.prog.due).getTime());
-      earliestDue[q.id] = dues.length ? Math.min(...dues) : 0;
-    }
+    if (hasDue) dueList.push(q);
     if (hasNew) newList.push(q);
     if (hasWrong) wrongList.push(q);
     if (hasReinforcement) reinforcementList.push(q);
   }
 
-  // Sort due by oldest due first, then importance desc
-  dueList.sort((a, b) => {
-    const d = (earliestDue[a.id] || 0) - (earliestDue[b.id] || 0);
-    if (d !== 0) return d;
-    return (b.importance || 3) - (a.importance || 3);
-  });
-  // Sort new by importance desc, then created
-  newList.sort((a, b) => {
-    const ai = (b.importance || 3) - (a.importance || 3);
-    if (ai !== 0) return ai;
-    return (a.createdAt || '').localeCompare(b.createdAt || '');
-  });
-  // Sort wrong by total lapses across blanks desc
-  const totalLapses = (q) => getBlankStates(q).reduce((sum, x) => sum + (x.prog ? x.prog.lapses : 0), 0);
-  wrongList.sort((a, b) => totalLapses(b) - totalLapses(a));
-  // 定着中は正解回数が少ない問題を先にし、同数なら前回学習が古いものを優先する。
-  const reinforcementScore = (q) => {
-    const ss = getBlankStates(q).filter(isReinforcementBlank);
-    const minCorrect = ss.length ? Math.min(...ss.map(x => x.correctCount)) : MASTER_CORRECT_COUNT;
-    const oldest = ss.map(x => x.prog && x.prog.lastReviewed ? new Date(x.prog.lastReviewed).getTime() : 0);
-    return [minCorrect, oldest.length ? Math.min(...oldest) : 0];
-  };
-  reinforcementList.sort((a, b) => {
-    const aa = reinforcementScore(a), bb = reinforcementScore(b);
-    return aa[0] - bb[0] || aa[1] - bb[1];
-  });
-
   const reinforcementIds = new Set(reinforcementList.map(q => q.id));
-  const dueOnly = dueList.filter(q => !reinforcementIds.has(q.id));
-  const newOnly = newList.filter(q => !reinforcementIds.has(q.id));
-  const wrongOnly = wrongList.filter(q => !reinforcementIds.has(q.id));
-  const reinforce = shuffle(reinforcementList);
+  // 日次上限や混合比率で候補を絞る段階から、出題回数の少ない問題を優先する。
+  const reinforce = prioritizeByFewestPresentations(reinforcementList);
+  const dueOnly = prioritizeByFewestPresentations(dueList.filter(q => !reinforcementIds.has(q.id)));
+  const newOnly = prioritizeByFewestPresentations(newList.filter(q => !reinforcementIds.has(q.id)));
+  const wrongOnly = prioritizeByFewestPresentations(wrongList.filter(q => !reinforcementIds.has(q.id)));
 
   let deck = [];
   if (mode === 'review') {
-    deck = uniqueQuestions([...reinforce, ...shuffle(dueOnly.slice(0, revCap))]);
+    deck = uniqueQuestions([...reinforce, ...dueOnly.slice(0, revCap)]);
   } else if (mode === 'new') {
-    deck = uniqueQuestions([...reinforce, ...shuffle(newOnly.slice(0, newCap))]);
+    deck = uniqueQuestions([...reinforce, ...newOnly.slice(0, newCap)]);
   } else if (mode === 'wrong') {
-    deck = uniqueQuestions([...reinforce, ...shuffle(wrongOnly)]);
+    deck = uniqueQuestions([...reinforce, ...wrongOnly]);
   } else if (mode === 'mixed') {
-    // 定着中を先に確保し、残枠へ従来どおり新規・復習を指定比率で混ぜる。
+    // 定着中を候補へ確保し、残りは従来どおり新規・復習の指定比率で選ぶ。
     const [nrRaw, rrRaw] = state.settings.mixRatio.split(':').map(Number);
     const nr = Number.isFinite(nrRaw) && nrRaw >= 0 ? nrRaw : 3;
     const rr = Number.isFinite(rrRaw) && rrRaw >= 0 ? rrRaw : 7;
@@ -1689,10 +1863,14 @@ function buildDeck(mode) {
     const remaining = Math.max(0, target - reinforce.length);
     const nN = Math.min(newOnly.length, newCap, Math.floor(remaining * nr / ratioTotal));
     const rN = Math.min(dueOnly.length, revCap, remaining - nN);
-    const news = shuffle(newOnly.slice(0, nN));
-    const revs = shuffle(dueOnly.slice(0, rN));
+    const news = newOnly.slice(0, nN);
+    const revs = dueOnly.slice(0, rN);
     deck = uniqueQuestions([...reinforce, ...interleave(revs, news)]);
   }
+
+  // モード固有の対象範囲・日次上限・混合比率を保った候補集合全体を、
+  // 実出題回数の少ない順に並べ、同数だけランダム化する。
+  deck = prioritizeByFewestPresentations(deck);
   if (size > 0 && deck.length > size) deck = deck.slice(0, size);
   return deck;
 }
@@ -1724,6 +1902,7 @@ function startStudy(mode) {
   }
   state.studyDeck = deck;
   state.studyIdx = 0;
+  state.studyPresentedKeys = new Set();
   state.studyStats = { again: 0, hard: 0, good: 0, easy: 0, total: 0, mode };
   renderStudy();
   showView('view-study');
@@ -1738,10 +1917,18 @@ function renderStudy() {
   document.getElementById('progress-text').textContent = `${idx + 1} / ${total}`;
 
   const q = state.studyDeck[idx];
+  const presentationKey = `${idx}:${q.id}:${questionHash(q)}`;
+  if (!(state.studyPresentedKeys instanceof Set)) state.studyPresentedKeys = new Set();
+  if (!state.studyPresentedKeys.has(presentationKey)) {
+    state.studyPresentedKeys.add(presentationKey);
+    markQuestionPresented(q);
+  }
 
   // Meta
   const meta = [];
   meta.push(`<span class="meta-cat">${CATS[q.category] || q.category}</span>`);
+  const questionRound = currentQuestionRound(q);
+  meta.push(`<span class="meta-round">問題 ${questionRound}周目</span>`);
   if (q.importance) {
     const stars = '★'.repeat(q.importance);
     meta.push(`<span class="meta-imp">${stars}</span>`);
@@ -1774,7 +1961,7 @@ function renderStudy() {
   state.quiz = {
     q, active, idx: 0, results: [], hadNew,
     finished: false, phase: 'input', blankStart: 0,
-    masteredNow: [],
+    masteredNow: [], questionRound, roundCommitted: false,
   };
 
   if (active.length > 0) {
@@ -1808,7 +1995,9 @@ function renderQuizBlank() {
   document.getElementById('quiz-area').hidden = false;
   const labelEl = document.getElementById('quiz-blank-label');
   const totalBlanks = getBlanks(state.quiz.q).length;
-  const masteryLabel = `<span class="qbl-mastery">正解 ${b.correctCount}/${MASTER_CORRECT_COUNT}</span>`;
+  const blankRound = Math.min(MASTER_CORRECT_COUNT, b.correctCount + 1);
+  const masteryLabel = `<span class="qbl-round">この穴 ${blankRound}周目</span>` +
+    `<span class="qbl-mastery">正解 ${b.correctCount}/${MASTER_CORRECT_COUNT}</span>`;
   labelEl.innerHTML = (totalBlanks > 1)
     ? `<span class="qbl-num">${escapeHtml(b.label)}</span> の解答 <span class="qbl-count">(${idx + 1}/${active.length})</span>${masteryLabel}`
     : `解答を入力 ${masteryLabel}`;
@@ -1932,6 +2121,7 @@ async function finishQuizQuestion() {
   if (hadNew) await bumpTodayCounter('new');
   else await bumpTodayCounter('rev');
   await recordDailyStudy({ allCorrect, hadNew, mode: state.studyStats && state.studyStats.mode });
+  const completedRound = await completeQuestionRound(q);
 
   // セッション統計(問題単位)
   state.studyStats.total += 1;
@@ -1942,6 +2132,7 @@ async function finishQuizQuestion() {
   ansEl.hidden = false;
   const head = active.length > 1 ? `${active.length}問中 ${correctCount}問正解` : (allCorrect ? '正解' : '不正解');
   let summary = `<div class="quiz-summary ${allCorrect ? 'all-ok' : 'some-ng'}">${head}</div>`;
+  summary += `<div class="quiz-question-round">問題 ${completedRound}周目 完了</div>`;
   if (masteredNow && masteredNow.length) {
     summary += `<div class="quiz-mastered">🎓 ${masteredNow.length}個の穴を習得（3回正解。次回から問題文に正解を表示）</div>`;
   }
@@ -2137,6 +2328,7 @@ async function saveEditor() {
   let rec;
   if (state.editingId) {
     rec = state.questions.find(x => x.id === state.editingId);
+    const oldQuestionHash = questionHash(rec);
     rec.category = state.editingCat;
     rec.question = qText;
     rec.answer = aText;
@@ -2147,6 +2339,7 @@ async function saveEditor() {
     rec.author = author || rec.author || '';
     rec.modifiedAt = new Date().toISOString();
     rec.contentHash = contentHash(rec);
+    if (rec.contentHash !== oldQuestionHash) await deleteQuestionStat(rec.id);
     // 進捗キーは解答内容に紐づくため、解答が変わった穴だけ自然に新規化される。
     // この問題のどの穴にも該当しなくなった進捗(=解答が変わった/消えた穴)を掃除する。
     await pruneOrphanBlankProgress(rec);
@@ -2196,6 +2389,7 @@ async function deleteEditor() {
       delete state.progress[k];
     }
   }
+  await deleteQuestionStat(deletedId);
   state.questions = state.questions.filter(q => q.id !== deletedId);
   state.editingId = null;
   toast('削除しました');
@@ -2396,7 +2590,7 @@ const ICLOUD_FILENAME = 'shoshin-study-sync.json';
 
 async function iCloudSave() {
   const data = {
-    version: 3,
+    version: 4,
     type: 'icloud-sync',
     savedAt: new Date().toISOString(),
     deviceHint: navigator.userAgent.includes('iPhone') ? 'iPhone'
@@ -2404,6 +2598,7 @@ async function iCloudSave() {
     settings: state.settings,
     questions: state.questions,
     progress: Object.values(state.progress),
+    questionStats: Object.values(state.questionStats),
     sessions: Object.values(state.dailyStudy),
   };
   // iPhoneのSafariではdownloadリンクがファイルアプリに保存される
@@ -2454,6 +2649,7 @@ async function iCloudLoad(file) {
     for (const p of progArr) state.progress[p.questionId] = p;
     await migrateProgressToPerBlank();
     await migrateProgressCorrectCounts();
+    await replaceQuestionStats(data.questionStats || []);
 
     const sessionRaw = Array.isArray(data.sessions)
       ? data.sessions
@@ -2477,12 +2673,13 @@ async function iCloudLoad(file) {
 
 async function exportAll() {
   const data = {
-    version: 3,
+    version: 4,
     type: 'full',
     exportedAt: new Date().toISOString(),
     settings: state.settings,
     questions: state.questions,
     progress: state.progress,
+    questionStats: state.questionStats,
     sessions: state.dailyStudy,
   };
   downloadJSON(data, `shoshin-shiken-full-${dateKey()}.json`);
@@ -2567,6 +2764,7 @@ async function importQuestionsReplace(file) {
     }
     await dbReplaceAll(STORE_Q, incoming, []);
     state.questions = [...incoming];
+    await reconcileQuestionStats();
 
     // 各問題で、現在の穴に該当しない古い進捗(解答変更/削除された穴)を掃除
     await pruneAllOrphanProgress();
@@ -2634,12 +2832,14 @@ async function importJSON(file, full) {
       }
       await migrateProgressToPerBlank();
       await migrateProgressCorrectCounts();
+      await replaceQuestionStats(data.questionStats || []);
 
       const sessionRaw = Array.isArray(data.sessions)
         ? data.sessions
         : Object.values(data.sessions || data.dailyStudy || {});
       await replaceDailyStudyHistory(sessionRaw);
     }
+    if (!full) await reconcileQuestionStats();
     if (full && data.settings) {
       state.settings = { ...state.settings, ...data.settings };
       await saveSettings();
@@ -2845,6 +3045,7 @@ async function importCSV(file) {
     incoming.forEach(q => delete q._matched);
     await dbReplaceAll(STORE_Q, incoming, []);
     state.questions = [...incoming];
+    await reconcileQuestionStats();
     await pruneAllOrphanProgress();
 
     const kept = Object.keys(state.progress).length;
@@ -2879,8 +3080,9 @@ function parseDelim(text, sep) {
 }
 
 async function resetProgress() {
-  await Promise.all([dbClear(STORE_P), dbClear(STORE_S)]);
+  await Promise.all([dbClear(STORE_P), dbClear(STORE_S), dbClear(STORE_R)]);
   state.progress = {};
+  state.questionStats = {};
   state.dailyStudy = {};
   await metaSet('todayCounters', { date: state.todayKey, new: 0, rev: 0 });
   state.todaySeen = { new: 0, rev: 0 };
@@ -2891,15 +3093,16 @@ async function resetProgress() {
 async function resetAll() {
   // 全ストアを1トランザクションでクリア
   await new Promise((resolve, reject) => {
-    const t = db.transaction([STORE_Q, STORE_P, STORE_S, STORE_M, STORE_A], 'readwrite');
+    const t = db.transaction([STORE_Q, STORE_P, STORE_S, STORE_M, STORE_A, STORE_R], 'readwrite');
     t.onerror = () => reject(t.error);
     t.oncomplete = resolve;
-    [STORE_Q, STORE_P, STORE_S, STORE_M, STORE_A].forEach(s => t.objectStore(s).clear());
+    [STORE_Q, STORE_P, STORE_S, STORE_M, STORE_A, STORE_R].forEach(s => t.objectStore(s).clear());
   });
   closeSourcePageViewer();
   clearSourceAssetUrlCache();
   state.questions = [];
   state.progress = {};
+  state.questionStats = {};
   state.dailyStudy = {};
   state.sourceIndex = emptySourceIndex();
   state.settings = {
@@ -3256,7 +3459,7 @@ function bindEvents() {
 
   // Settings: reset
   document.getElementById('btn-reset-progress').addEventListener('click', async () => {
-    const ok = await confirm('全ての学習進捗(SM-2の状態・履歴・本日のカウンタ・日別学習数)をリセットします。\n問題自体は残ります。よろしいですか?');
+    const ok = await confirm('全ての学習進捗(SM-2の状態・穴の正解回数・問題の周回数・本日のカウンタ・日別学習数)をリセットします。\n問題自体は残ります。よろしいですか?');
     if (!ok) return;
     await resetProgress();
   });
