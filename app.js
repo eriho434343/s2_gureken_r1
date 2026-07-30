@@ -20,7 +20,8 @@ const STORE_M = 'meta';
 const STORE_A = 'sourceAssets';
 const STORE_R = 'questionStats';
 
-const APP_VERSION = '2.6.3';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.6.4';  // バージョンが変わっても IndexedDB のデータは保持される
+const QUESTION_EDIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
 const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
 const SOURCE_INDEX_MAX_BYTES = 64 * 1024 * 1024;
@@ -501,6 +502,51 @@ function contentHash(q) {
   return (h >>> 0).toString(36);
 }
 
+// アプリ内で既存問題を修正した後は、端末時刻を基準に24時間だけ出題対象から外す。
+// 問題共有用エクスポートには含めず、学習状態を含む完全バックアップ・iCloud同期には保持する。
+function questionEditCooldownUntil(q) {
+  if (!q || !q.inAppEditCooldownUntil) return 0;
+  const t = new Date(q.inAppEditCooldownUntil).getTime();
+  return Number.isFinite(t) ? t : 0;
+}
+
+function isQuestionInEditCooldown(q, now = Date.now()) {
+  return questionEditCooldownUntil(q) > now;
+}
+
+function applyQuestionEditCooldown(q, now = Date.now()) {
+  const until = new Date(now + QUESTION_EDIT_COOLDOWN_MS).toISOString();
+  q.inAppEditCooldownUntil = until;
+  return until;
+}
+
+function preserveLatestQuestionEditCooldown(target, existing, now = Date.now()) {
+  if (!target) return;
+  const until = Math.max(questionEditCooldownUntil(target), questionEditCooldownUntil(existing));
+  if (until > now) target.inAppEditCooldownUntil = new Date(until).toISOString();
+  else delete target.inAppEditCooldownUntil;
+}
+
+function questionEditableSignature(q) {
+  const year = q && q.year != null && q.year !== '' ? Number(q.year) : null;
+  return JSON.stringify({
+    category: String((q && q.category) || 'common'),
+    question: String((q && q.question) || ''),
+    answer: String((q && q.answer) || ''),
+    tags: Array.isArray(q && q.tags) ? q.tags.map(String) : [],
+    source: String((q && q.source) || ''),
+    year: Number.isFinite(year) ? year : null,
+    importance: Math.max(1, Math.min(5, Number(q && q.importance) || 3)),
+    author: String((q && q.author) || ''),
+  });
+}
+
+function questionForSharing(q) {
+  const copy = { ...q };
+  delete copy.inAppEditCooldownUntil;
+  return copy;
+}
+
 
 // ============================================
 // Local/private source index and page images
@@ -885,12 +931,22 @@ async function getSourceAssetUrl(id) {
 
 function closeSourcePageViewer() {
   if (!sourcePageViewer) return;
+  const previousFocus = sourceViewerPreviousFocus;
   document.removeEventListener('keydown', handleSourceViewerKeydown);
   sourcePageViewer.remove();
   sourcePageViewer = null;
   document.body.classList.remove('source-viewer-open');
-  if (sourceViewerPreviousFocus && document.contains(sourceViewerPreviousFocus)) {
-    try { sourceViewerPreviousFocus.focus(); } catch (e) { /* ignore */ }
+
+  // 出典画像へフォーカスを戻すと、次のEnterで画像が再度開いてしまう。
+  // 学習結果画面では「次へ」を復帰先にし、Enterを通常の学習操作へ戻す。
+  const studyView = document.getElementById('view-study');
+  const nextButton = document.getElementById('btn-quiz-next');
+  if (studyView && studyView.classList.contains('active') &&
+      nextButton && !nextButton.hidden && !nextButton.disabled) {
+    try { nextButton.focus(); } catch (e) { /* ignore */ }
+  } else if (previousFocus && document.contains(previousFocus) &&
+             !(previousFocus.closest && previousFocus.closest('.source-page-visual'))) {
+    try { previousFocus.focus(); } catch (e) { /* ignore */ }
   }
   sourceViewerPreviousFocus = null;
 }
@@ -972,6 +1028,7 @@ function bindSourcePageVisual(wrapper) {
   wrapper.addEventListener('keydown', e => {
     if (e.key === 'Enter' || e.key === ' ') {
       e.preventDefault();
+      e.stopPropagation();
       openSourcePageViewer(wrapper);
     }
   });
@@ -1682,12 +1739,14 @@ function showView(name) {
 // HOME view
 // ============================================
 function getDeckCounts(catFilter) {
+  const now = Date.now();
   const reviewIds = new Set();
   const newIds = new Set();
   const reinforcementIds = new Set();
   const totalIds = new Set();
   for (const q of state.questions) {
     if (catFilter !== 'all' && q.category !== catFilter) continue;
+    if (isQuestionInEditCooldown(q, now)) continue;
     const states = getBlankStates(q);
     const hasDue = states.some(s => s.st === 'due');
     const hasNew = isCompletelyUnstudiedQuestion(q, states);
@@ -1706,9 +1765,11 @@ function getDeckCounts(catFilter) {
 }
 
 function getWrongCount(catFilter) {
+  const now = Date.now();
   let n = 0;
   for (const q of state.questions) {
     if (catFilter !== 'all' && q.category !== catFilter) continue;
+    if (isQuestionInEditCooldown(q, now)) continue;
     const states = getBlankStates(q);
     if (states.some(s => s.prog && s.st !== 'mastered' && s.prog.lapses >= 1 && s.prog.interval < 14)) n++;
   }
@@ -1824,6 +1885,7 @@ function prioritizeByFewestPresentations(items) {
 function buildDeck(mode) {
   const cat = state.selectedCat;
   const size = state.selectedSize;
+  const now = Date.now();
   const newCap = Math.max(0, state.settings.newPerDay - state.todaySeen.new);
   const revCap = Math.max(0, state.settings.revPerDay - state.todaySeen.rev);
 
@@ -1838,6 +1900,7 @@ function buildDeck(mode) {
   // 「新規を学ぶ」は、全穴に学習履歴がない完全な未学習問題だけを対象にする。
   for (const q of state.questions) {
     if (!filterCat(q)) continue;
+    if (isQuestionInEditCooldown(q, now)) continue;
     const states = getBlankStates(q);
     const hasDue = states.some(s => s.st === 'due');
     const hasNew = isCompletelyUnstudiedQuestion(q, states);
@@ -2215,6 +2278,11 @@ function goNextQuestion() {
   }
 }
 
+function continueStudyFromDone() {
+  const mode = state.studyStats.mode || 'mixed';
+  startStudy(mode);
+}
+
 function finishStudy() {
   stopTTS();
   const s = state.studyStats;
@@ -2227,6 +2295,13 @@ function finishStudy() {
     `<span style="color:var(--good)">●</span> 普通 ${s.good}　` +
     `<span style="color:var(--easy)">●</span> 簡単 ${s.easy}`;
   showView('view-done');
+  setTimeout(() => {
+    const againButton = document.getElementById('btn-done-again');
+    const doneView = document.getElementById('view-done');
+    if (againButton && doneView && doneView.classList.contains('active')) {
+      try { againButton.focus(); } catch (e) { /* ignore */ }
+    }
+  }, 0);
 }
 
 // ============================================
@@ -2361,7 +2436,7 @@ function openEditor(qid) {
 
 // 出題中に編集・保存した問題を、現在のセッションから除外して次へ進む。
 // 途中まで入力・判定していても、結果を見る前の履歴は従来どおり確定しない。
-// 問題自体は削除しないため、次回以降のセッションでは更新後の内容で通常どおり候補になりうる。
+// 問題自体は削除せず、24時間経過後は更新後の内容と学習状態に応じて候補へ戻る。
 function skipEditedQuestionInCurrentSession(questionId) {
   if (!questionId) return false;
   const currentIndex = Math.max(0, Math.floor(Number(state.studyIdx) || 0));
@@ -2404,8 +2479,14 @@ async function saveEditor() {
   const author = document.getElementById('ed-author').value.trim();
 
   let rec;
+  let didModifyExisting = false;
   if (state.editingId) {
     rec = state.questions.find(x => x.id === state.editingId);
+    if (!rec) {
+      toast('編集対象の問題が見つかりません');
+      return;
+    }
+    const beforeSignature = questionEditableSignature(rec);
     const oldQuestionHash = questionHash(rec);
     rec.category = state.editingCat;
     rec.question = qText;
@@ -2415,6 +2496,8 @@ async function saveEditor() {
     rec.year = year;
     rec.importance = state.editingImp;
     rec.author = author || rec.author || '';
+    didModifyExisting = questionEditableSignature(rec) !== beforeSignature;
+    if (didModifyExisting) applyQuestionEditCooldown(rec);
     rec.modifiedAt = new Date().toISOString();
     rec.contentHash = contentHash(rec);
     if (rec.contentHash !== oldQuestionHash) await deleteQuestionStat(rec.id);
@@ -2445,10 +2528,16 @@ async function saveEditor() {
   if (returnView === 'view-study' && savedEditingId) {
     // 出題中に編集・保存した問題は、このセッションから除外して再表示しない。
     const skipped = skipEditedQuestionInCurrentSession(savedEditingId);
-    toast(skipped ? '保存しました。このセッションでは再出題しません' : '保存しました');
+    if (didModifyExisting) {
+      toast('保存しました。修正した問題は24時間出題しません');
+    } else {
+      toast(skipped ? '保存しました。このセッションでは再出題しません' : '保存しました');
+    }
     if (!skipped) showView('view-study');
   } else {
-    toast(savedEditingId ? '保存しました' : '追加しました');
+    toast(savedEditingId
+      ? (didModifyExisting ? '保存しました。修正した問題は24時間出題しません' : '保存しました')
+      : '追加しました');
     showView('view-list');
   }
 }
@@ -2771,7 +2860,7 @@ async function exportQuestionsOnly() {
     type: 'questions-only',
     exportedAt: new Date().toISOString(),
     note: '問題のみのエクスポート(進捗・設定は含まれません)。共有用。',
-    questions: state.questions,
+    questions: state.questions.map(questionForSharing),
   };
   downloadJSON(data, `shoshin-shiken-questions-${dateKey()}.json`);
   toast(`${state.questions.length}問をエクスポートしました`);
@@ -2837,6 +2926,8 @@ async function importQuestionsReplace(file) {
     for (const q of incoming) {
       if (!q.id) q.id = uid();
       if (!q.category) q.category = 'common';
+      const existing = state.questions.find(x => x.id === q.id);
+      preserveLatestQuestionEditCooldown(q, existing);
       if (!q.contentHash) q.contentHash = contentHash(q);
       if (!q.createdAt) q.createdAt = new Date().toISOString();
       if (!q.modifiedAt) q.modifiedAt = q.createdAt;
@@ -2879,6 +2970,7 @@ async function importJSON(file, full) {
 
       const existing = state.questions.find(x => x.id === q.id);
       if (existing) {
+        if (!full) preserveLatestQuestionEditCooldown(q, existing);
         // Merge: keep newer (modifiedAt-based); skip if local is newer/equal
         const localTime = new Date(existing.modifiedAt || existing.createdAt || 0).getTime();
         const importTime = new Date(q.modifiedAt || q.createdAt || 0).getTime();
@@ -3081,6 +3173,7 @@ async function importCSV(file) {
         modifiedAt: now,
       };
       q.contentHash = contentHash(q);
+      preserveLatestQuestionEditCooldown(q, matched);
       q._matched = matched;
       incoming.push(q);
     }
@@ -3362,32 +3455,53 @@ function bindEvents() {
 
   function handleStudyEnter(e) {
     if (e.key !== 'Enter') return;
-    if (e.isComposing || e.keyCode === 229) return;  // IME変換中は無視
+    if (e.isComposing || e.keyCode === 229 || e.repeat) return;  // IME変換中・長押しは無視
     if (_enterBlocked) return;
 
     // モーダルが開いていたら何もしない
     const modal = document.getElementById('modal');
     if (modal && !modal.hidden) return;
 
-    // 出題画面でなければ何もしない
+    // 出典ビューア表示中のEnterは、ビューア内のボタン操作だけに任せる。
+    // 背後の「判定」「次へ」には絶対に伝えない。
+    if (sourcePageViewer) return;
+
+    const activeElement = document.activeElement;
+    const viewDone = document.getElementById('view-done');
+    if (viewDone && viewDone.classList.contains('active')) {
+      // 完了画面内のボタンにフォーカスがある場合は、そのボタン本来のEnter動作を優先する。
+      if (activeElement && viewDone.contains(activeElement) && activeElement.tagName === 'BUTTON') return;
+      e.preventDefault();
+      e.stopPropagation();
+      blockEnter(250);
+      continueStudyFromDone();
+      return;
+    }
+
+    // class="active"を基準に判定する。hidden属性はビュー切替に使っていない。
     const viewStudy = document.getElementById('view-study');
-    if (!viewStudy || viewStudy.hidden) return;
+    if (!viewStudy || !viewStudy.classList.contains('active')) return;
+
+    // 出典画像自体にフォーカスがあるEnterは、画像拡大の操作として扱う。
+    if (activeElement && activeElement.closest && activeElement.closest('.source-page-visual')) return;
 
     // 編集フォームなど他のinput/textareaにフォーカスがある場合は何もしない
-    const tag = (document.activeElement || {}).tagName || '';
-    const activeId = (document.activeElement || {}).id || '';
+    const tag = (activeElement || {}).tagName || '';
+    const activeId = (activeElement || {}).id || '';
     if ((tag === 'INPUT' || tag === 'TEXTAREA') && activeId !== 'quiz-input') return;
-
-    e.preventDefault();
 
     // quiz-inputが表示中かつbtn-quiz-judgeが有効 → 判定
     const judgeBtn = document.getElementById('btn-quiz-judge');
     const nextBtn = document.getElementById('btn-quiz-next');
     if (judgeBtn && !judgeBtn.hidden) {
+      e.preventDefault();
+      e.stopPropagation();
       blockEnter();
       judgeQuizBlank();
     } else if (nextBtn && !nextBtn.hidden && !nextBtn.disabled) {
       // 次の穴 or 結果を見る or 次の問題へ
+      e.preventDefault();
+      e.stopPropagation();
       blockEnter(200);  // 次問題ロード中は少し長めにブロック
       nextQuizBlank();
     }
@@ -3433,10 +3547,7 @@ function bindEvents() {
 
   // Done
   document.getElementById('btn-done-home').addEventListener('click', () => { showView('view-home'); renderHome(); });
-  document.getElementById('btn-done-again').addEventListener('click', () => {
-    const mode = state.studyStats.mode || 'mixed';
-    startStudy(mode);
-  });
+  document.getElementById('btn-done-again').addEventListener('click', continueStudyFromDone);
 
   // List
   document.getElementById('btn-add').addEventListener('click', () => openEditor(null));
