@@ -20,7 +20,7 @@ const STORE_M = 'meta';
 const STORE_A = 'sourceAssets';
 const STORE_R = 'questionStats';
 
-const APP_VERSION = '2.6.5';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.7.0';  // バージョンが変わっても IndexedDB のデータは保持される
 const QUESTION_EDIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
 const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
@@ -155,6 +155,9 @@ async function metaGet(key) { const r = await dbGet(STORE_M, key); return r ? r.
 // 習得(マスター)の条件: 同じ穴に累計3回正解したら習得。
 // 正解速度はSM-2評価にだけ使い、習得回数には影響させない。
 const MASTER_CORRECT_COUNT = 3;
+// 復習期日を「推定保持率がおよそ90%まで下がる時点」とみなす。
+// 期日超過後は指数型の忘却近似で保持率を再計算し、低い穴を優先する。
+const REVIEW_TARGET_RETENTION = 0.90;
 const BLANK_FAST_SEC = 30;  // 1穴あたりこの秒数以内ならSM-2上の「簡単」
 const BLANK_SLOW_SEC = 60;  // これを超えるとSM-2上の「難」
 
@@ -234,15 +237,11 @@ function isCompletelyUnstudiedQuestion(q, states = null) {
   return rows.length > 0 && rows.every(s => s.st === 'new' && !s.prog && s.correctCount === 0);
 }
 
-// 問題が新規以外の学習モードで選ばれたら、3回正解前の穴は期日に関係なく必ず再出題する。
+// 問題が出題対象になったら、3回正解前の穴を回答対象にする。
+// 問題自体を選ぶ時点では期日到来を条件とし、期日前の定着中問題を先取りしない。
 // 習得済みの穴だけは入力対象から外し、問題文側へ正解を埋め込む。
 function qActiveBlanks(q) {
   return getBlankStates(q).filter(s => s.st !== 'mastered');
-}
-
-// 「間違えた問題」でも同じルールを適用し、正解済み1～2回の穴を省略しない。
-function qWrongFocusBlanks(q) {
-  return qActiveBlanks(q);
 }
 
 function newProgress(key) {
@@ -264,17 +263,23 @@ function newProgress(key) {
 
 function applySM2(p, rating) {
   // rating: 1=Again, 2=Hard, 3=Good, 4=Easy
+  // 3回正解までを同日反復で消化しないよう、最初の正解後は必ず翌日、
+  // 2回目の正解後は3/4/7日後へ広げる。以降は従来どおりeaseに適応する。
   const before = p.interval;
+  const priorCorrectCount = progressCorrectCount(p);
+  const history = Array.isArray(p.history) ? p.history : [];
+  const lastRating = history.length ? Number(history[history.length - 1] && history[history.length - 1].r) : 0;
+  const recoveringFromLapse = lastRating === 1 || (Number(p.reps) === 0 && Number(p.lapses) > 0);
   if (rating === 1) {
     p.reps = 0;
     p.interval = 1;
     p.ease = Math.max(1.3, p.ease - 0.20);
     p.lapses += 1;
   } else {
-    if (p.reps === 0) {
-      p.interval = rating === 2 ? 1 : (rating === 3 ? 1 : 4);
-    } else if (p.reps === 1) {
-      p.interval = rating === 2 ? 3 : (rating === 3 ? 6 : 10);
+    if (recoveringFromLapse || priorCorrectCount === 0) {
+      p.interval = 1;
+    } else if (priorCorrectCount === 1) {
+      p.interval = rating === 2 ? 3 : (rating === 3 ? 4 : 7);
     } else {
       const factor = rating === 2 ? 1.2 : (rating === 3 ? p.ease : p.ease * 1.3);
       p.interval = Math.max(1, Math.round(p.interval * factor));
@@ -1626,7 +1631,7 @@ async function recordDailyStudy({ allCorrect, hadNew, mode }) {
   rec.studied += 1;
   if (allCorrect) rec.correct += 1;
   if (hadNew) rec.newCount += 1; else rec.reviewCount += 1;
-  const modeKey = ['review', 'new', 'mixed', 'wrong'].includes(mode) ? mode : 'other';
+  const modeKey = ['daily', 'new', 'review', 'mixed', 'wrong'].includes(mode) ? mode : 'other';
   rec.modes[modeKey] = Math.max(0, Math.floor(Number(rec.modes[modeKey]) || 0)) + 1;
   rec.updatedAt = new Date().toISOString();
   state.dailyStudy[today] = rec;
@@ -1742,7 +1747,6 @@ function getDeckCounts(catFilter) {
   const now = Date.now();
   const reviewIds = new Set();
   const newIds = new Set();
-  const reinforcementIds = new Set();
   const totalIds = new Set();
   for (const q of state.questions) {
     if (catFilter !== 'all' && q.category !== catFilter) continue;
@@ -1750,30 +1754,15 @@ function getDeckCounts(catFilter) {
     const states = getBlankStates(q);
     const hasDue = states.some(s => s.st === 'due');
     const hasNew = isCompletelyUnstudiedQuestion(q, states);
-    const hasReinforcement = states.some(isReinforcementBlank);
-    if (hasDue || hasReinforcement) reviewIds.add(q.id);
+    if (hasDue) reviewIds.add(q.id);
     if (hasNew) newIds.add(q.id);
-    if (hasReinforcement) reinforcementIds.add(q.id);
-    if (hasDue || hasNew || hasReinforcement) totalIds.add(q.id);
+    if (hasDue || hasNew) totalIds.add(q.id);
   }
   return {
     due: reviewIds.size,
     newq: newIds.size,
-    reinforce: reinforcementIds.size,
     total: totalIds.size,
   };
-}
-
-function getWrongCount(catFilter) {
-  const now = Date.now();
-  let n = 0;
-  for (const q of state.questions) {
-    if (catFilter !== 'all' && q.category !== catFilter) continue;
-    if (isQuestionInEditCooldown(q, now)) continue;
-    const states = getBlankStates(q);
-    if (states.some(s => s.prog && s.st !== 'mastered' && s.prog.lapses >= 1 && s.prog.interval < 14)) n++;
-  }
-  return n;
 }
 
 function renderHome() {
@@ -1782,7 +1771,7 @@ function renderHome() {
     c.classList.toggle('active', c.dataset.cat === state.selectedCat);
   });
   // Counts
-  const { due, newq, reinforce, total } = getDeckCounts(state.selectedCat);
+  const { due, newq, total } = getDeckCounts(state.selectedCat);
   document.getElementById('num-due').textContent = due;
   document.getElementById('num-new').textContent = newq;
   const heroTotal = total;
@@ -1793,10 +1782,8 @@ function renderHome() {
   document.getElementById('num-streak').textContent = computeStreak();
 
   // Sub labels
-  document.getElementById('btn-review-sub').textContent = `期日・3回正解前の問題 (${due}問)`;
+  document.getElementById('btn-review-sub').textContent = `期限到来${due}問を優先し、残り枠を未学習で補完`;
   document.getElementById('btn-new-sub').textContent = `未学習問題 (${newq}問)`;
-  const wrongN = getWrongCount(state.selectedCat);
-  document.getElementById('btn-wrong-sub').textContent = `誤答${wrongN}問 + 定着中${reinforce}問`;
 
   // Cat stats line
   const cs = document.getElementById('cat-stats');
@@ -1873,13 +1860,94 @@ function uniqueQuestions(items) {
 }
 
 // 問題単位の完了出題回数が少ない順。同数は毎回ランダムに並べる。
+// 未学習問題の順序、および同じ復習期日の問題の最終タイブレークに使う。
 // 回答途中で中断した問題は完了回数が増えないため、未出題と同じ優先度を保つ。
-// decorate-sort-undecorate方式により、sort比較中に乱数を呼ばず偏りを抑える。
 function prioritizeByFewestPresentations(items) {
   return uniqueQuestions(items)
     .map((q, index) => ({ q, count: presentedQuestionCount(q), random: Math.random(), index }))
     .sort((a, b) => a.count - b.count || a.random - b.random || a.index - b.index)
     .map(row => row.q);
+}
+
+function lastProgressRating(p) {
+  const history = Array.isArray(p && p.history) ? p.history : [];
+  const last = history.length ? history[history.length - 1] : null;
+  const rating = Number(last && last.r);
+  return Number.isFinite(rating) ? rating : 0;
+}
+
+function estimatedBlankRetention(p, now = startOfDay()) {
+  if (!p) return 1;
+  const intervalDays = Math.max(1, Number(p.interval) || 1);
+  const dueTime = p.due ? startOfDay(new Date(p.due)).getTime() : NaN;
+  let reviewedTime = p.lastReviewed ? startOfDay(new Date(p.lastReviewed)).getTime() : NaN;
+  if (!Number.isFinite(reviewedTime) && Number.isFinite(dueTime)) {
+    reviewedTime = dueTime - intervalDays * 86400000;
+  }
+  if (!Number.isFinite(reviewedTime)) return REVIEW_TARGET_RETENTION;
+  const elapsedDays = Math.max(0, (startOfDay(now).getTime() - reviewedTime) / 86400000);
+  // interval日後に保持率がREVIEW_TARGET_RETENTIONになる指数型近似。
+  return Math.max(0, Math.min(1, Math.pow(REVIEW_TARGET_RETENTION, elapsedDays / intervalDays)));
+}
+
+// 各問題で期日を迎えた穴のうち、推定保持率が最も低い穴を問題の忘却リスクとする。
+// 同程度なら、直前誤答・失敗回数・古い期日・少ない完了回数の順で優先する。
+function reviewPriorityInfo(q) {
+  const dueStates = getBlankStates(q).filter(s => s.st === 'due' && s.prog && s.prog.due);
+  if (!dueStates.length) return null;
+  let estimatedRetention = 1;
+  let earliestDue = Infinity;
+  let recentWrong = 0;
+  let maxLapses = 0;
+  for (const stateRow of dueStates) {
+    const p = stateRow.prog;
+    estimatedRetention = Math.min(estimatedRetention, estimatedBlankRetention(p));
+    const dueTime = startOfDay(new Date(p.due)).getTime();
+    if (Number.isFinite(dueTime)) earliestDue = Math.min(earliestDue, dueTime);
+    if (lastProgressRating(p) === 1) recentWrong = 1;
+    maxLapses = Math.max(maxLapses, Math.max(0, Math.floor(Number(p.lapses) || 0)));
+  }
+  return {
+    estimatedRetention,
+    earliestDue,
+    recentWrong,
+    maxLapses,
+    completed: completedQuestionRounds(q),
+  };
+}
+
+function prioritizeDueQuestions(items) {
+  return uniqueQuestions(items)
+    .map((q, index) => ({ q, info: reviewPriorityInfo(q), random: Math.random(), index }))
+    .filter(row => row.info)
+    .sort((a, b) =>
+      a.info.estimatedRetention - b.info.estimatedRetention ||
+      b.info.recentWrong - a.info.recentWrong ||
+      b.info.maxLapses - a.info.maxLapses ||
+      a.info.earliestDue - b.info.earliestDue ||
+      a.info.completed - b.info.completed ||
+      a.random - b.random ||
+      a.index - b.index
+    )
+    .map(row => row.q);
+}
+
+// 復習を先に確保したうえで、新規問題を均等に差し込む。
+// 最初の1問は必ず復習とし、期限切れの消化を妨げずにインターリーブ効果を残す。
+function spreadNewAmongReviews(reviews, news) {
+  const r = reviews.slice();
+  const n = news.slice();
+  if (!r.length) return n;
+  if (!n.length) return r;
+  const out = [];
+  let newIndex = 0;
+  const gap = Math.max(1, Math.ceil(r.length / (n.length + 1)));
+  for (let i = 0; i < r.length; i++) {
+    out.push(r[i]);
+    if ((i + 1) % gap === 0 && newIndex < n.length) out.push(n[newIndex++]);
+  }
+  while (newIndex < n.length) out.push(n[newIndex++]);
+  return uniqueQuestions(out);
 }
 
 function buildDeck(mode) {
@@ -1888,81 +1956,37 @@ function buildDeck(mode) {
   const now = Date.now();
   const newCap = Math.max(0, state.settings.newPerDay - state.todaySeen.new);
   const revCap = Math.max(0, state.settings.revPerDay - state.todaySeen.rev);
-
   const filterCat = (q) => cat === 'all' || q.category === cat;
 
   const dueList = [];
   const newList = [];
-  const wrongList = [];
-  const reinforcementList = [];
-
-  // 正解1～2回の「定着中」は、復習・混合・間違えた問題の候補へ加える。
-  // 「新規を学ぶ」は、全穴に学習履歴がない完全な未学習問題だけを対象にする。
   for (const q of state.questions) {
     if (!filterCat(q)) continue;
     if (isQuestionInEditCooldown(q, now)) continue;
     const states = getBlankStates(q);
-    const hasDue = states.some(s => s.st === 'due');
-    const hasNew = isCompletelyUnstudiedQuestion(q, states);
-    const hasWrong = states.some(s => s.prog && s.st !== 'mastered' && s.prog.lapses >= 1 && s.prog.interval < 14);
-    const hasReinforcement = states.some(isReinforcementBlank);
-    if (hasDue) dueList.push(q);
-    if (hasNew) newList.push(q);
-    if (hasWrong) wrongList.push(q);
-    if (hasReinforcement) reinforcementList.push(q);
+    if (states.some(s => s.st === 'due')) dueList.push(q);
+    if (isCompletelyUnstudiedQuestion(q, states)) newList.push(q);
   }
 
-  const reinforcementIds = new Set(reinforcementList.map(q => q.id));
-  // 日次上限や混合比率で候補を絞る段階から、出題回数の少ない問題を優先する。
-  const reinforce = prioritizeByFewestPresentations(reinforcementList);
-  const dueOnly = prioritizeByFewestPresentations(dueList.filter(q => !reinforcementIds.has(q.id)));
-  const newOnly = prioritizeByFewestPresentations(newList.filter(q => !reinforcementIds.has(q.id)));
-  const wrongOnly = prioritizeByFewestPresentations(wrongList.filter(q => !reinforcementIds.has(q.id)));
+  const due = prioritizeDueQuestions(dueList);
+  const fresh = prioritizeByFewestPresentations(newList);
+  const normalizedMode = ['review', 'mixed', 'wrong'].includes(mode) ? 'daily' : mode;
 
-  let deck = [];
-  if (mode === 'review') {
-    deck = uniqueQuestions([...reinforce, ...dueOnly.slice(0, revCap)]);
-  } else if (mode === 'new') {
-    // 新規モードには定着中を混ぜず、完全な未学習問題だけを日次上限内で出題する。
-    deck = newOnly.slice(0, newCap);
-  } else if (mode === 'wrong') {
-    deck = uniqueQuestions([...reinforce, ...wrongOnly]);
-  } else if (mode === 'mixed') {
-    // 定着中を候補へ確保し、残りは従来どおり新規・復習の指定比率で選ぶ。
-    const [nrRaw, rrRaw] = state.settings.mixRatio.split(':').map(Number);
-    const nr = Number.isFinite(nrRaw) && nrRaw >= 0 ? nrRaw : 3;
-    const rr = Number.isFinite(rrRaw) && rrRaw >= 0 ? rrRaw : 7;
-    const ratioTotal = Math.max(1, nr + rr);
-    const target = size > 0 ? size : (reinforce.length + dueOnly.length + newOnly.length);
-    const remaining = Math.max(0, target - reinforce.length);
-    const nN = Math.min(newOnly.length, newCap, Math.floor(remaining * nr / ratioTotal));
-    const rN = Math.min(dueOnly.length, revCap, remaining - nN);
-    const news = newOnly.slice(0, nN);
-    const revs = dueOnly.slice(0, rN);
-    deck = uniqueQuestions([...reinforce, ...interleave(revs, news)]);
+  if (normalizedMode === 'new') {
+    let deck = fresh.slice(0, newCap);
+    if (size > 0 && deck.length > size) deck = deck.slice(0, size);
+    return deck;
   }
 
-  // モード固有の対象範囲・日次上限・混合比率を保った候補集合全体を、
-  // 完了した出題回数の少ない順に並べ、同数だけランダム化する。
-  deck = prioritizeByFewestPresentations(deck);
-  if (size > 0 && deck.length > size) deck = deck.slice(0, size);
-  return deck;
-}
-
-function interleave(a, b) {
-  const out = [];
-  const max = Math.max(a.length, b.length);
-  for (let i = 0; i < max; i++) {
-    if (i < a.length) out.push(a[i]);
-    if (i < b.length) out.push(b[i]);
-  }
-  // light shuffle within blocks of 3 for variety
-  for (let i = 0; i < out.length; i += 3) {
-    const block = out.slice(i, i + 3);
-    const sh = shuffle(block);
-    for (let j = 0; j < block.length; j++) out[i + j] = sh[j];
-  }
-  return out;
+  // 「今日の学習」: 期限到来の復習を先に採用し、空き枠だけ未学習問題で補う。
+  // 期日前の定着中問題、専用の誤答ドリル、固定比率の混合は行わない。
+  const target = size > 0 ? size : Number.POSITIVE_INFINITY;
+  const reviewLimit = Math.min(due.length, revCap, target);
+  const reviews = due.slice(0, reviewLimit);
+  const remaining = Number.isFinite(target) ? Math.max(0, target - reviews.length) : Number.POSITIVE_INFINITY;
+  const newLimit = Math.min(fresh.length, newCap, remaining);
+  const news = fresh.slice(0, newLimit);
+  return spreadNewAmongReviews(reviews, news);
 }
 
 // ============================================
@@ -2024,7 +2048,7 @@ function renderStudy() {
   document.getElementById('quiz-area').hidden = true;
   document.getElementById('quiz-feedback').hidden = true;
 
-  // モード・期日にかかわらず、累計3回正解前の穴をすべて出題する。
+  // 問題はSM-2の期日到来時だけ選ばれる。選ばれた問題では累計3回正解前の穴を回答する。
   // 習得済みの穴は上の問題文へ正解を埋め込み、入力対象から外す。
   const active = qActiveBlanks(q);
   const hadNew = active.some(s => s.st === 'new');
@@ -2279,7 +2303,7 @@ function goNextQuestion() {
 }
 
 function continueStudyFromDone() {
-  const mode = state.studyStats.mode || 'mixed';
+  const mode = state.studyStats.mode || 'daily';
   startStudy(mode);
 }
 
@@ -2823,7 +2847,6 @@ function renderSettings() {
   document.getElementById('set-exam-date').value = state.settings.examDate || '';
   document.getElementById('set-new-per-day').value = state.settings.newPerDay;
   document.getElementById('set-rev-per-day').value = state.settings.revPerDay;
-  document.getElementById('set-mix-ratio').value = state.settings.mixRatio;
   document.getElementById('set-theme').value = state.settings.theme;
   document.getElementById('set-font-size').value = state.settings.fontSize;
   document.getElementById('set-tts-auto').checked = !!state.settings.ttsAuto;
@@ -2835,7 +2858,6 @@ async function saveSettingsFromForm() {
   state.settings.examDate = document.getElementById('set-exam-date').value;
   state.settings.newPerDay = Math.max(0, Number(document.getElementById('set-new-per-day').value) || 10);
   state.settings.revPerDay = Math.max(0, Number(document.getElementById('set-rev-per-day').value) || 100);
-  state.settings.mixRatio = document.getElementById('set-mix-ratio').value;
   state.settings.theme = document.getElementById('set-theme').value;
   state.settings.fontSize = document.getElementById('set-font-size').value;
   state.settings.ttsAuto = document.getElementById('set-tts-auto').checked;
@@ -3514,10 +3536,8 @@ function bindEvents() {
     });
   });
   // Action buttons
-  document.getElementById('btn-review').addEventListener('click', () => startStudy('review'));
+  document.getElementById('btn-review').addEventListener('click', () => startStudy('daily'));
   document.getElementById('btn-new').addEventListener('click', () => startStudy('new'));
-  document.getElementById('btn-mixed').addEventListener('click', () => startStudy('mixed'));
-  document.getElementById('btn-wrong').addEventListener('click', () => startStudy('wrong'));
 
   // Settings open/close
   document.getElementById('btn-settings').addEventListener('click', () => {
@@ -3530,7 +3550,7 @@ function bindEvents() {
   });
 
   // Settings: live save fields
-  ['set-exam-date','set-new-per-day','set-rev-per-day','set-mix-ratio',
+  ['set-exam-date','set-new-per-day','set-rev-per-day',
    'set-theme','set-font-size','set-tts-auto','set-author-name'].forEach(id => {
     document.getElementById(id).addEventListener('change', saveSettingsFromForm);
   });

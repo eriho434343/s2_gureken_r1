@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#08090F" media="(prefers-color-scheme: dark)">
 <title>昇進試験 学習</title>
 <link rel="icon" type="image/png" href="icon-192.png">
-<link rel="stylesheet" href="styles.css?v=2.6.5">
+<link rel="stylesheet" href="styles.css?v=2.7.0">
 </head>
 <body>
 
@@ -54,8 +54,8 @@
         <button class="btn-primary" id="btn-review">
           <span class="btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="5 3 19 12 5 21 5 3"/></svg></span>
           <span class="btn-content">
-            <span class="btn-title">復習を開始</span>
-            <span class="btn-sub" id="btn-review-sub">期日が来た問題から</span>
+            <span class="btn-title">今日の学習</span>
+            <span class="btn-sub" id="btn-review-sub">期限到来を優先し、残りを未学習で補完</span>
           </span>
           <span class="btn-arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></span>
         </button>
@@ -64,22 +64,6 @@
           <span class="btn-content">
             <span class="btn-title">新規を学ぶ</span>
             <span class="btn-sub" id="btn-new-sub">未学習の問題</span>
-          </span>
-          <span class="btn-arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></span>
-        </button>
-        <button class="btn-tertiary" id="btn-mixed">
-          <span class="btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 3 21 3 21 8"/><line x1="4" y1="20" x2="21" y2="3"/><polyline points="21 16 21 21 16 21"/><line x1="15" y1="15" x2="21" y2="21"/><line x1="4" y1="4" x2="9" y2="9"/></svg></span>
-          <span class="btn-content">
-            <span class="btn-title">混合学習(インターリーブ)</span>
-            <span class="btn-sub">復習+新規をシャッフル出題</span>
-          </span>
-          <span class="btn-arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></span>
-        </button>
-        <button class="btn-tertiary" id="btn-wrong">
-          <span class="btn-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></svg></span>
-          <span class="btn-content">
-            <span class="btn-title">間違えた問題</span>
-            <span class="btn-sub" id="btn-wrong-sub">直近で × にした問題</span>
           </span>
           <span class="btn-arrow"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="9 18 15 12 9 6"/></svg></span>
         </button>
@@ -384,15 +368,7 @@
           <span class="field-label">1日の復習上限</span>
           <input type="number" id="set-rev-per-day" min="0" max="500" value="100">
         </label>
-        <label class="field">
-          <span class="field-label">混合学習の比率(新規:復習)</span>
-          <select id="set-mix-ratio">
-            <option value="2:8">2:8(復習重視)</option>
-            <option value="3:7" selected>3:7</option>
-            <option value="5:5">5:5(均等)</option>
-            <option value="7:3">7:3(新規重視)</option>
-          </select>
-        </label>
+        <p class="hint">「今日の学習」は、期限到来・期限超過の復習を先に選び、セッションの空き枠だけ未学習問題で補います。復習は推定保持率が低い問題から出題し、誤答は翌日に短縮します。</p>
       </div>
 
       <div class="settings-section">
@@ -526,8 +502,8 @@
 
       <div class="settings-section about">
         <h3>このアプリ</h3>
-        <p>SM-2間隔反復・アクティブリコール・インターリービング・穴埋め式を採用。完全オフライン動作・無料。</p>
-        <p class="hint">v2.6.5 / Build 2026.08 (日別の穴あき正解率推移・アプリ内修正後24時間除外・出典画像表示中のEnter誤操作防止・10／20問完了後Enterで継続・新規モードは未学習問題のみ・全穴完了時のみ回数確定・少ない完了回数を優先・穴／問題周回・3回正解定着・日別学習問題数・ローカルPDF出典)</p>
+        <p>SM-2ベースの適応型間隔反復・アクティブリコール・インターリービング・穴埋め式を採用。完全オフライン動作・無料。</p>
+        <p class="hint">v2.7.0 / Build 2026.08（今日の学習へ統合・推定保持率順の復習・誤答翌日化・初回1日→2回目3/4/7日の拡張間隔・日別の穴あき正解率推移・アプリ内修正後24時間除外・出典画像表示中のEnter誤操作防止・新規モードは未学習問題のみ・全穴完了時のみ回数確定・穴／問題周回・3回正解定着・日別学習問題数・ローカルPDF出典）</p>
       </div>
     </div>
   </section>
@@ -548,6 +524,6 @@
   </div>
 </div>
 
-<script src="app.js?v=2.6.5"></script>
+<script src="app.js?v=2.7.0"></script>
 </body>
 </html>
