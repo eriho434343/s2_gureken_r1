@@ -20,7 +20,7 @@ const STORE_M = 'meta';
 const STORE_A = 'sourceAssets';
 const STORE_R = 'questionStats';
 
-const APP_VERSION = '2.7.1';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.7.0';  // バージョンが変わっても IndexedDB のデータは保持される
 const QUESTION_EDIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
 const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
@@ -658,9 +658,6 @@ function validateSourceIndex(data) {
           throw new Error('マーカー情報が大きすぎます');
         }
       }
-      if (ref.sourceKind != null && !['pdf', 'pptx', 'powerpoint', 'image', 'raster'].includes(String(ref.sourceKind).toLowerCase())) {
-        throw new Error('出典資料の種別が正しくありません');
-      }
       if (ref.pageImage != null) validateSourcePageImage(ref.pageImage);
     }
   }
@@ -870,25 +867,6 @@ function sourcePercent(value) {
   return (Math.max(0, Math.min(1, Number(value) || 0)) * 100).toFixed(4);
 }
 
-function sourceReferenceKind(ref, documentName = '') {
-  const explicit = String((ref && ref.sourceKind) || '').toLowerCase();
-  if (explicit === 'pptx' || explicit === 'powerpoint') return 'pptx';
-  if (explicit === 'image' || explicit === 'raster') return 'image';
-  if (explicit === 'pdf') return 'pdf';
-  if (/\.pptx?$/i.test(documentName)) return 'pptx';
-  if (/\.(?:png|jpe?g|webp)$/i.test(documentName)) return 'image';
-  return 'pdf';
-}
-
-function sourceReferencePageText(ref, documentName, compact = false) {
-  const pageNo = Number.isInteger(ref && ref.page) ? ref.page : '';
-  const kind = sourceReferenceKind(ref, documentName);
-  if (!pageNo) return kind === 'image' ? '資料画像' : '資料';
-  if (kind === 'pptx') return compact ? `スライド ${pageNo}` : `PowerPoint スライド ${pageNo}`;
-  if (kind === 'image') return '資料画像';
-  return `PDF p.${pageNo}`;
-}
-
 function sourcePageVisualHtml(ref, documentName) {
   const pageImage = ref && ref.pageImage;
   if (!pageImage || !pageImage.assetId) return '';
@@ -897,19 +875,15 @@ function sourcePageVisualHtml(ref, documentName) {
     `<span class="source-page-mark" style="left:${sourcePercent(rect.x)}%;top:${sourcePercent(rect.y)}%;width:${sourcePercent(rect.w)}%;height:${sourcePercent(rect.h)}%"></span>`
   ).join('');
   const pageNo = Number.isInteger(ref.page) ? ref.page : '';
-  const kind = sourceReferenceKind(ref, documentName);
-  const pageLabel = kind === 'pptx'
-    ? '該当PowerPointスライド'
-    : (kind === 'image' ? '該当資料画像' : '該当PDFページ');
+  const isRaster = /\.(?:png|jpe?g|webp)$/i.test(documentName);
+  const pageLabel = isRaster ? '該当資料画像' : '該当PDFページ';
   const note = rects.length
     ? '<span class="source-page-key" aria-hidden="true"></span>黄色の枠が穴抜き解答の該当箇所です。'
     : '画像上の解答位置は安全に特定できなかったため、ページ画像のみ表示しています。';
-  const locationText = sourceReferencePageText(ref, documentName, true);
-  const alt = `${documentName}${locationText ? ` ${locationText}` : ''} の画像`;
+  const alt = `${documentName}${pageNo ? ` PDF p.${pageNo}` : ''} のページ画像`;
   return `<div class="source-page-visual${rects.length ? ' has-marks' : ''}" ` +
     `data-source-asset-id="${escapeHtml(pageImage.assetId)}" ` +
     `data-source-document="${escapeHtml(documentName)}" data-source-page="${escapeHtml(pageNo)}" ` +
-    `data-source-kind="${escapeHtml(kind)}" data-source-location="${escapeHtml(locationText)}" ` +
     `data-source-width="${pageImage.width}" tabindex="0" role="button" aria-label="${escapeHtml(alt)}を拡大表示">` +
       `<div class="source-page-caption"><span>${pageLabel}</span><span>タップで拡大</span></div>` +
       `<div class="source-page-stage" style="aspect-ratio:${pageImage.width}/${pageImage.height}">` +
@@ -1006,7 +980,7 @@ function openSourcePageViewer(wrapper) {
   const titleStrong = document.createElement('strong');
   titleStrong.textContent = wrapper.dataset.sourceDocument || '出典資料';
   const titlePage = document.createElement('span');
-  titlePage.textContent = wrapper.dataset.sourceLocation || (wrapper.dataset.sourcePage ? `PDF p.${wrapper.dataset.sourcePage}` : '資料画像');
+  titlePage.textContent = wrapper.dataset.sourcePage ? `PDF p.${wrapper.dataset.sourcePage}` : '資料画像';
   title.append(titleStrong, titlePage);
 
   const actions = document.createElement('div');
@@ -1111,8 +1085,7 @@ function renderQuestionSources(q) {
       const match = ref.match === 'verified' ? 'verified' : (ref.match === 'inferred' ? 'inferred' : 'citation');
       const badge = match === 'verified' ? '資料内の一致箇所' : (match === 'inferred' ? '資料内の一致候補' : '出典情報のみ');
       const documentName = String(ref.document || '出典資料');
-      const pageText = sourceReferencePageText(ref, documentName, true);
-      const page = Number.isInteger(ref.page) && ref.page > 0 ? `<span class="source-page">${escapeHtml(pageText)}</span>` : '';
+      const page = Number.isInteger(ref.page) && ref.page > 0 ? `<span class="source-page">PDF p.${ref.page}</span>` : '';
       const visual = sourcePageVisualHtml(ref, documentName);
       body += `<article class="source-ref ${match}">` +
         visual +
