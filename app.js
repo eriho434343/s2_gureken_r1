@@ -20,7 +20,7 @@ const STORE_M = 'meta';
 const STORE_A = 'sourceAssets';
 const STORE_R = 'questionStats';
 
-const APP_VERSION = '2.6.4';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.6.5';  // バージョンが変わっても IndexedDB のデータは保持される
 const QUESTION_EDIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
 const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
@@ -2626,6 +2626,101 @@ function renderDailyStudyTrend() {
     <p class="daily-trend-note">完了した問題を1回ごとに集計します。${hasMigrated ? '更新前の期間は、既存の穴別履歴から同じ問題を日ごとに重複除去して復元しています。' : ''}</p>`;
 }
 
+// 穴ごとの確定済み回答履歴から、日別の正解数・回答数を集計する。
+// rating 1 は不正解、rating 2/3/4 は正解。回答途中で中断した問題は
+// commitQuizProgress() が実行されないため、履歴にも正解率にも含まれない。
+function dailyBlankAccuracyByDate() {
+  const byDate = {};
+  for (const p of Object.values(state.progress)) {
+    for (const h of (Array.isArray(p && p.history) ? p.history : [])) {
+      const d = h && typeof h.d === 'string' ? h.d : '';
+      const rating = Number(h && h.r);
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(d) || !Number.isFinite(rating) || rating < 1 || rating > 4) continue;
+      if (!byDate[d]) byDate[d] = { correct: 0, total: 0 };
+      byDate[d].total += 1;
+      if (rating >= 2) byDate[d].correct += 1;
+    }
+  }
+  return byDate;
+}
+
+function blankAccuracySummary(series) {
+  const total = series.reduce((sum, x) => sum + x.total, 0);
+  const correct = series.reduce((sum, x) => sum + x.correct, 0);
+  return {
+    correct,
+    total,
+    accuracy: total > 0 ? Math.round(correct / total * 100) : null,
+  };
+}
+
+function renderDailyBlankAccuracyTrend() {
+  const el = document.getElementById('daily-blank-accuracy');
+  if (!el) return;
+
+  const byDate = dailyBlankAccuracyByDate();
+  const now = startOfDay();
+  const series = [];
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const key = dateKey(d);
+    const rec = byDate[key] || { correct: 0, total: 0 };
+    const total = Math.max(0, Math.floor(Number(rec.total) || 0));
+    const correct = Math.max(0, Math.min(total, Math.floor(Number(rec.correct) || 0)));
+    series.push({
+      key,
+      label: `${d.getMonth() + 1}/${d.getDate()}`,
+      correct,
+      total,
+      accuracy: total > 0 ? Math.round(correct / total * 100) : null,
+    });
+  }
+
+  const today = blankAccuracySummary(series.slice(-1));
+  const last7 = blankAccuracySummary(series.slice(-7));
+  const last30 = blankAccuracySummary(series);
+  const activeDays = series.filter(x => x.total > 0).length;
+  const fmtPct = value => value == null ? '—' : String(value);
+
+  const bars = series.map((x, i) => {
+    const hasData = x.total > 0;
+    const height = hasData ? Math.max(3, x.accuracy) : 0;
+    const showLabel = i === 0 || i === series.length - 1 || i % 5 === 0;
+    const title = hasData
+      ? `${x.key}: 正解率 ${x.accuracy}%（${x.correct}/${x.total}穴）`
+      : `${x.key}: 穴回答なし`;
+    const value = hasData ? `${x.accuracy}%` : '';
+    return `<div class="blank-accuracy-day${hasData ? '' : ' no-data'}" title="${title}" aria-label="${title}">
+      <div class="blank-accuracy-value">${value}</div>
+      <div class="blank-accuracy-bar-track"><div class="blank-accuracy-bar" style="height:${height}%"></div></div>
+      <div class="blank-accuracy-label">${showLabel ? x.label : ''}</div>
+    </div>`;
+  }).join('');
+
+  el.innerHTML = `<div class="daily-trend-summary blank-accuracy-summary">
+      <div><span>今日</span><strong>${fmtPct(today.accuracy)}</strong><small>${today.accuracy == null ? '' : '%'}</small><em>${today.total}穴</em></div>
+      <div><span>直近7日</span><strong>${fmtPct(last7.accuracy)}</strong><small>${last7.accuracy == null ? '' : '%'}</small><em>${last7.total}穴</em></div>
+      <div><span>直近30日</span><strong>${fmtPct(last30.accuracy)}</strong><small>${last30.accuracy == null ? '' : '%'}</small><em>${last30.total}穴</em></div>
+      <div><span>学習日数</span><strong>${activeDays}</strong><small>日</small><em>30日中</em></div>
+    </div>
+    <div class="daily-trend-scroll blank-accuracy-scroll" tabindex="0" aria-label="直近30日の日別穴あき正解率。横にスクロールできます">
+      <div class="blank-accuracy-chart" role="img" aria-label="日ごとの穴あき正解率を0パーセントから100パーセントで表示">
+        <div class="blank-accuracy-guide guide-100"><span>100%</span></div>
+        <div class="blank-accuracy-guide guide-50"><span>50%</span></div>
+        <div class="blank-accuracy-guide guide-0"><span>0%</span></div>
+        <div class="blank-accuracy-bars">${bars}</div>
+      </div>
+    </div>
+    <p class="daily-trend-note blank-accuracy-note">保存済みの穴履歴から日別集計します。正解率＝正解した穴数÷回答した穴数。全ての穴を回答して「結果を見る」まで完了した問題だけを集計し、回答途中で中断した問題は含めません。「やっぱり正解だった」は正解として集計します。</p>`;
+
+  // スマホでは直近の日付が最初に見えるよう、横スクロールを右端へ合わせる。
+  const scroller = typeof el.querySelector === 'function' ? el.querySelector('.blank-accuracy-scroll') : null;
+  if (scroller && typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => { scroller.scrollLeft = scroller.scrollWidth; });
+  }
+}
+
 function renderStats() {
   let total = state.questions.length;
   let mastered = 0, review = 0, learning = 0, newq = 0, leech = 0;
@@ -2645,6 +2740,7 @@ function renderStats() {
   document.getElementById('stat-leech').textContent = leech;
 
   renderDailyStudyTrend();
+  renderDailyBlankAccuracyTrend();
 
   // Heatmap (last 30 days / blank answers)
   const counts = {};
