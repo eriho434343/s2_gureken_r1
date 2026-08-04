@@ -7,7 +7,7 @@
 <meta name="theme-color" content="#08090F" media="(prefers-color-scheme: dark)">
 <title>昇進試験 学習</title>
 <link rel="icon" type="image/png" href="icon-192.png">
-<link rel="stylesheet" href="styles.css?v=2.7.0">
+<link rel="stylesheet" href="styles.css?v=2.8.0">
 </head>
 <body>
 
@@ -297,17 +297,36 @@
       <div></div>
     </header>
     <div class="content">
-      <div class="stats-grid">
-        <div class="stat-card"><div class="stat-num" id="stat-total">0</div><div class="stat-label">問題総数</div></div>
-        <div class="stat-card"><div class="stat-num" id="stat-mastered">0</div><div class="stat-label">習得済</div></div>
-        <div class="stat-card"><div class="stat-num" id="stat-review">0</div><div class="stat-label">復習中</div></div>
-        <div class="stat-card"><div class="stat-num" id="stat-learning">0</div><div class="stat-label">学習中</div></div>
-        <div class="stat-card"><div class="stat-num" id="stat-newq">0</div><div class="stat-label">未学習</div></div>
-        <div class="stat-card"><div class="stat-num" id="stat-leech">0</div><div class="stat-label">苦手</div></div>
+      <div class="stats-section stats-overview-section">
+        <h3>穴あき単位の状況</h3>
+        <div class="stats-grid blank-stats-grid">
+          <div class="stat-card"><div class="stat-num" id="stat-blank-total">0</div><div class="stat-label">総穴あき数</div></div>
+          <div class="stat-card"><div class="stat-num" id="stat-blank-mastered">0</div><div class="stat-label">習得済穴</div></div>
+          <div class="stat-card"><div class="stat-num" id="stat-blank-learning">0</div><div class="stat-label">学習中穴</div></div>
+          <div class="stat-card"><div class="stat-num" id="stat-blank-due">0</div><div class="stat-label">復習期限穴</div></div>
+          <div class="stat-card"><div class="stat-num" id="stat-blank-new">0</div><div class="stat-label">未学習穴</div></div>
+          <div class="stat-card"><div class="stat-num" id="stat-blank-leech">0</div><div class="stat-label">苦手穴</div></div>
+        </div>
+        <div id="blank-mastery-overview" class="blank-mastery-overview"></div>
+      </div>
+      <div class="stats-section stats-overview-section">
+        <h3>問題単位の状況</h3>
+        <div class="stats-grid question-stats-grid">
+          <div class="stat-card"><div class="stat-num" id="stat-total">0</div><div class="stat-label">問題総数</div></div>
+          <div class="stat-card"><div class="stat-num" id="stat-mastered">0</div><div class="stat-label">習得済</div></div>
+          <div class="stat-card"><div class="stat-num" id="stat-review">0</div><div class="stat-label">復習中</div></div>
+          <div class="stat-card"><div class="stat-num" id="stat-learning">0</div><div class="stat-label">学習中</div></div>
+          <div class="stat-card"><div class="stat-num" id="stat-newq">0</div><div class="stat-label">未学習</div></div>
+          <div class="stat-card"><div class="stat-num" id="stat-leech">0</div><div class="stat-label">苦手</div></div>
+        </div>
       </div>
       <div class="stats-section">
         <h3>1日で勉強した問題数の推移</h3>
         <div id="daily-study-trend" class="daily-study-trend"></div>
+      </div>
+      <div class="stats-section">
+        <h3>1日で勉強した穴あき数の推移</h3>
+        <div id="daily-blank-study-trend" class="daily-study-trend daily-blank-study-trend"></div>
       </div>
       <div class="stats-section">
         <h3>直近30日の穴あき正解率の推移</h3>
@@ -318,7 +337,7 @@
         <div id="heatmap" class="heatmap"></div>
       </div>
       <div class="stats-section">
-        <h3>カテゴリ別の習得進捗</h3>
+        <h3>カテゴリ別の習得進捗（穴あき数）</h3>
         <div id="cat-progress"></div>
       </div>
       <div class="stats-section">
@@ -435,7 +454,7 @@
 
       <div class="settings-section">
         <h3>ローカル出典データ</h3>
-        <p class="hint">共通・ソリューション・法人営業資料から作成したPDFページ画像とハイライト座標を、この端末のIndexedDBだけに保存します。GitHub、通常バックアップ、iCloud同期には含めません。</p>
+        <p class="hint">共通・ソリューション・エンジニアリング等の資料から作成したPDFページ画像とハイライト座標を、この端末のIndexedDBだけに保存します。GitHub、通常バックアップ、iCloud同期には含めません。</p>
         <div class="source-index-card">
           <div class="source-index-status" id="source-index-status">
             <strong>未読み込み</strong><span>出典データはこの端末にだけ保存されます</span>
@@ -503,7 +522,7 @@
       <div class="settings-section about">
         <h3>このアプリ</h3>
         <p>SM-2ベースの適応型間隔反復・アクティブリコール・インターリービング・穴埋め式を採用。完全オフライン動作・無料。</p>
-        <p class="hint">v2.7.0 / Build 2026.08（今日の学習へ統合・推定保持率順の復習・誤答翌日化・初回1日→2回目3/4/7日の拡張間隔・日別の穴あき正解率推移・アプリ内修正後24時間除外・出典画像表示中のEnter誤操作防止・新規モードは未学習問題のみ・全穴完了時のみ回数確定・穴／問題周回・3回正解定着・日別学習問題数・ローカルPDF出典）</p>
+        <p class="hint">v2.8.0 / Build 2026.08（今日の学習へ統合・推定保持率順の復習・誤答翌日化・初回1日→2回目3/4/7日の拡張間隔・穴あき単位の進捗・日別穴あき数／正解率推移・アプリ内修正後24時間除外・出典画像表示中のEnter誤操作防止・新規モードは未学習問題のみ・全穴完了時のみ回数確定・穴／問題周回・3回正解定着・日別学習問題数・ローカルPDF出典）</p>
       </div>
     </div>
   </section>
@@ -524,6 +543,6 @@
   </div>
 </div>
 
-<script src="app.js?v=2.7.0"></script>
+<script src="app.js?v=2.8.0"></script>
 </body>
 </html>

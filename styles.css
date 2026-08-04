@@ -2128,3 +2128,111 @@ body.source-viewer-open { overflow: hidden; }
 .blank-accuracy-guide.guide-50 { top: 98px; }
 .blank-accuracy-guide.guide-0 { bottom: 18px; }
 
+/* ===== v2.8.0: 穴あき単位の進捗・日別穴あき数 ===== */
+.stats-overview-section .stats-grid {
+  margin-bottom: 12px;
+}
+.blank-stats-grid .stat-card:first-child {
+  background: linear-gradient(155deg, color-mix(in srgb, var(--primary) 11%, var(--bg-1)), var(--bg-1));
+  border-color: color-mix(in srgb, var(--primary) 22%, var(--border));
+}
+.blank-stats-grid .stat-card:nth-child(2) .stat-num { color: var(--good); }
+.blank-stats-grid .stat-card:nth-child(4) .stat-num { color: var(--violet); }
+.blank-stats-grid .stat-card:nth-child(5) .stat-num { color: var(--text-muted); }
+.blank-stats-grid .stat-card:nth-child(6) .stat-num { color: var(--again); }
+.blank-mastery-overview {
+  padding: 13px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  background: var(--bg-1);
+  box-shadow: var(--shadow-1);
+}
+.blank-overview-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 8px;
+}
+.blank-overview-head span {
+  color: var(--text-muted);
+  font-size: 12px;
+  font-weight: 650;
+}
+.blank-overview-head strong {
+  color: var(--good);
+  font-size: 22px;
+  line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.blank-overview-bar {
+  height: 9px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--bg-soft);
+}
+.blank-overview-bar > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--good), var(--primary));
+  box-shadow: 0 0 8px color-mix(in srgb, var(--good) 25%, transparent);
+  transition: width 0.45s var(--ease-out);
+}
+.blank-overview-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-top: 9px;
+  color: var(--text-muted);
+  font-size: 10.5px;
+  font-variant-numeric: tabular-nums;
+}
+.blank-mastery-overview p {
+  margin: 8px 0 0;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  line-height: 1.5;
+}
+.daily-trend-bar.blank-study-bar {
+  background: linear-gradient(to top, var(--violet), var(--primary));
+}
+.cat-prog-detail {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 10px;
+  margin-top: 6px;
+  color: var(--text-faint);
+  font-size: 9.5px;
+  font-variant-numeric: tabular-nums;
+}
+.cat-prog-detail .detail-mastered { color: var(--good); }
+.cat-prog-detail .detail-review { color: var(--violet); }
+.cat-prog-detail .detail-learning { color: var(--accent); }
+.cat-prog-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+  margin-top: 4px;
+  padding: 9px 10px;
+  border-radius: var(--r-sm);
+  background: var(--bg-2);
+  color: var(--text-muted);
+  font-size: 9.5px;
+}
+.cat-prog-legend span {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.cat-prog-legend i {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+}
+.cat-prog-legend .legend-mastered { background: var(--good); }
+.cat-prog-legend .legend-review { background: var(--violet); }
+.cat-prog-legend .legend-learning { background: var(--accent); }
+.cat-prog-legend .legend-new { background: var(--bg-soft); border: 1px solid var(--border-strong); }
+

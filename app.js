@@ -20,7 +20,7 @@ const STORE_M = 'meta';
 const STORE_A = 'sourceAssets';
 const STORE_R = 'questionStats';
 
-const APP_VERSION = '2.7.0';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.8.0';  // バージョンが変わっても IndexedDB のデータは保持される
 const QUESTION_EDIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
 const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
@@ -2605,6 +2605,69 @@ async function deleteEditor() {
 // ============================================
 // STATS view
 // ============================================
+// 現在の問題バンクを、実際に回答・習得する最小単位である「穴」単位に集計する。
+// total = mastered + learning + newq。due と leech は learning の内数。
+function blankProgressSummary(questions = state.questions) {
+  const result = {
+    total: 0,
+    mastered: 0,
+    learning: 0,
+    due: 0,
+    waiting: 0,
+    newq: 0,
+    leech: 0,
+    unmastered: 0,
+    masteryRate: 0,
+  };
+
+  for (const q of (Array.isArray(questions) ? questions : [])) {
+    for (const s of getBlankStates(q)) {
+      result.total += 1;
+      if (s.st === 'mastered') {
+        result.mastered += 1;
+        continue;
+      }
+
+      const p = s.prog;
+      if (!p) {
+        result.newq += 1;
+        continue;
+      }
+
+      result.learning += 1;
+      if (s.st === 'due') result.due += 1;
+      else result.waiting += 1;
+      if (Math.max(0, Number(p.lapses) || 0) >= 4 && Math.max(0, Number(p.interval) || 0) < 7) {
+        result.leech += 1;
+      }
+    }
+  }
+
+  result.unmastered = Math.max(0, result.total - result.mastered);
+  result.masteryRate = result.total > 0 ? Math.round(result.mastered / result.total * 100) : 0;
+  return result;
+}
+
+function renderBlankMasteryOverview(summary) {
+  const el = document.getElementById('blank-mastery-overview');
+  if (!el) return;
+  const s = summary || blankProgressSummary();
+  const masteredWidth = s.total > 0 ? Math.max(0, Math.min(100, s.mastered / s.total * 100)) : 0;
+  el.innerHTML = `<div class="blank-overview-head">
+      <span>穴あき習得率</span>
+      <strong>${s.masteryRate}%</strong>
+    </div>
+    <div class="blank-overview-bar" role="progressbar" aria-label="穴あき習得率" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${s.masteryRate}">
+      <span style="width:${masteredWidth}%"></span>
+    </div>
+    <div class="blank-overview-detail">
+      <span>習得済 ${s.mastered}穴</span>
+      <span>未習得 ${s.unmastered}穴</span>
+      <span>復習期限 ${s.due}穴</span>
+    </div>
+    <p>「復習期限」と「苦手」は学習中の穴の内数です。各穴は累計3回正解すると習得済みになります。</p>`;
+}
+
 function renderDailyStudyTrend() {
   const el = document.getElementById('daily-study-trend');
   if (!el) return;
@@ -2666,6 +2729,60 @@ function dailyBlankAccuracyByDate() {
     }
   }
   return byDate;
+}
+
+// 保存済みの穴履歴から、直近30日の「回答した穴数」を表示する。
+// 同じ穴を同じ日に複数回完了した場合も、回答した回数としてそれぞれ集計する。
+function renderDailyBlankStudyTrend() {
+  const el = document.getElementById('daily-blank-study-trend');
+  if (!el) return;
+
+  const byDate = dailyBlankAccuracyByDate();
+  const now = startOfDay();
+  const series = [];
+  for (let i = 29; i >= 0; i--) {
+    const d = new Date(now);
+    d.setDate(d.getDate() - i);
+    const key = dateKey(d);
+    const rec = byDate[key] || { correct: 0, total: 0 };
+    series.push({
+      key,
+      label: `${d.getMonth() + 1}/${d.getDate()}`,
+      count: Math.max(0, Math.floor(Number(rec.total) || 0)),
+    });
+  }
+
+  const max = Math.max(1, ...series.map(x => x.count));
+  const today = series[series.length - 1].count;
+  const last7 = series.slice(-7);
+  const average7 = last7.reduce((sum, x) => sum + x.count, 0) / 7;
+  const total30 = series.reduce((sum, x) => sum + x.count, 0);
+  const best = Math.max(...series.map(x => x.count));
+  const bars = series.map((x, i) => {
+    const height = x.count > 0 ? Math.max(5, Math.round(x.count / max * 100)) : 0;
+    const showLabel = i === 0 || i === series.length - 1 || i % 5 === 0;
+    return `<div class="daily-trend-day" title="${x.key}: ${x.count}穴" aria-label="${x.key} ${x.count}穴">
+      <div class="daily-trend-value">${x.count || ''}</div>
+      <div class="daily-trend-bar-track"><div class="daily-trend-bar blank-study-bar" style="height:${height}%"></div></div>
+      <div class="daily-trend-label">${showLabel ? x.label : ''}</div>
+    </div>`;
+  }).join('');
+
+  el.innerHTML = `<div class="daily-trend-summary">
+      <div><span>今日</span><strong>${today}</strong><small>穴</small></div>
+      <div><span>7日平均</span><strong>${average7.toFixed(1)}</strong><small>穴/日</small></div>
+      <div><span>30日合計</span><strong>${total30}</strong><small>穴</small></div>
+      <div><span>最多</span><strong>${best}</strong><small>穴/日</small></div>
+    </div>
+    <div class="daily-trend-scroll daily-blank-study-scroll" tabindex="0" aria-label="直近30日の日別学習穴あき数。横にスクロールできます">
+      <div class="daily-trend-chart">${bars}</div>
+    </div>
+    <p class="daily-trend-note">全ての対象穴を回答して「結果を見る」まで完了した問題について、回答した穴を1回ごとに集計します。回答途中で中断した問題は含めません。</p>`;
+
+  const scroller = typeof el.querySelector === 'function' ? el.querySelector('.daily-blank-study-scroll') : null;
+  if (scroller && typeof requestAnimationFrame === 'function') {
+    requestAnimationFrame(() => { scroller.scrollLeft = scroller.scrollWidth; });
+  }
 }
 
 function blankAccuracySummary(series) {
@@ -2763,7 +2880,17 @@ function renderStats() {
   document.getElementById('stat-newq').textContent = newq;
   document.getElementById('stat-leech').textContent = leech;
 
+  const blankSummary = blankProgressSummary();
+  document.getElementById('stat-blank-total').textContent = blankSummary.total;
+  document.getElementById('stat-blank-mastered').textContent = blankSummary.mastered;
+  document.getElementById('stat-blank-learning').textContent = blankSummary.learning;
+  document.getElementById('stat-blank-due').textContent = blankSummary.due;
+  document.getElementById('stat-blank-new').textContent = blankSummary.newq;
+  document.getElementById('stat-blank-leech').textContent = blankSummary.leech;
+  renderBlankMasteryOverview(blankSummary);
+
   renderDailyStudyTrend();
+  renderDailyBlankStudyTrend();
   renderDailyBlankAccuracyTrend();
 
   // Heatmap (last 30 days / blank answers)
@@ -2788,34 +2915,42 @@ function renderStats() {
   }
   document.getElementById('heatmap').innerHTML = cells.join('');
 
-  // Cat progress
+  // Cat progress: 問題数ではなく、穴あき数を母数として表示する。
   const cp = document.getElementById('cat-progress');
   const html = ['common','solution','engineering'].map(c => {
     const qs = state.questions.filter(q => q.category === c);
-    if (qs.length === 0) return `<div class="cat-prog-row">
-      <div class="cat-prog-label"><span>${CATS[c]}</span><span>0問</span></div>
+    const s = blankProgressSummary(qs);
+    if (s.total === 0) return `<div class="cat-prog-row">
+      <div class="cat-prog-label"><span>${CATS[c]}</span><span>0穴</span></div>
       <div class="cat-prog-bar"><div class="bar-new" style="width:100%"></div></div>
+      <div class="cat-prog-detail"><span>習得 0</span><span>期限 0</span><span>学習中 0</span><span>未学習 0</span></div>
     </div>`;
-    let mc=0, rc=0, lc=0, nc=0;
-    for (const q of qs) {
-      const s = cardStatus(q, state.progress[q.id]);
-      if (s === 'mastered') mc++;
-      else if (s === 'review') rc++;
-      else if (s === 'learning' || s === 'leech') lc++;
-      else nc++;
-    }
-    const t = qs.length;
+
+    // 棒グラフは重複しない4区分。期限到来は学習中から分けて表示する。
+    const waiting = Math.max(0, s.learning - s.due);
+    const rate = Math.round(s.mastered / s.total * 100);
     return `<div class="cat-prog-row">
-      <div class="cat-prog-label"><span>${CATS[c]}</span><span>${mc}/${t} 習得</span></div>
-      <div class="cat-prog-bar">
-        <div class="bar-mastered" style="width:${mc/t*100}%"></div>
-        <div class="bar-review" style="width:${rc/t*100}%"></div>
-        <div class="bar-learning" style="width:${lc/t*100}%"></div>
-        <div class="bar-new" style="width:${nc/t*100}%"></div>
+      <div class="cat-prog-label"><span>${CATS[c]}</span><span>${s.mastered}/${s.total}穴 習得 (${rate}%)</span></div>
+      <div class="cat-prog-bar" aria-label="${CATS[c]}の穴あき習得進捗">
+        <div class="bar-mastered" style="width:${s.mastered/s.total*100}%"></div>
+        <div class="bar-review" style="width:${s.due/s.total*100}%"></div>
+        <div class="bar-learning" style="width:${waiting/s.total*100}%"></div>
+        <div class="bar-new" style="width:${s.newq/s.total*100}%"></div>
+      </div>
+      <div class="cat-prog-detail">
+        <span class="detail-mastered">習得 ${s.mastered}</span>
+        <span class="detail-review">期限 ${s.due}</span>
+        <span class="detail-learning">期日前 ${waiting}</span>
+        <span class="detail-new">未学習 ${s.newq}</span>
       </div>
     </div>`;
   }).join('');
-  cp.innerHTML = html;
+  cp.innerHTML = html + `<div class="cat-prog-legend" aria-label="カテゴリ別進捗の凡例">
+    <span><i class="legend-mastered"></i>習得済</span>
+    <span><i class="legend-review"></i>復習期限</span>
+    <span><i class="legend-learning"></i>期日前</span>
+    <span><i class="legend-new"></i>未学習</span>
+  </div>`;
 
   // Forecast
   if (state.settings.examDate) {
