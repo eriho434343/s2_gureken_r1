@@ -20,7 +20,7 @@ const STORE_M = 'meta';
 const STORE_A = 'sourceAssets';
 const STORE_R = 'questionStats';
 
-const APP_VERSION = '2.8.0';  // バージョンが変わっても IndexedDB のデータは保持される
+const APP_VERSION = '2.9.0';  // バージョンが変わっても IndexedDB のデータは保持される
 const QUESTION_EDIT_COOLDOWN_MS = 24 * 60 * 60 * 1000;
 const SOURCE_INDEX_META_KEY = 'localSourceIndex';
 const SOURCE_INDEX_SCHEMA_VERSIONS = new Set([1, 2]);
@@ -31,6 +31,8 @@ const SOURCE_ASSET_MAX_COUNT = 1000;
 const SOURCE_ASSET_CACHE_LIMIT = 12;
 
 const CATS = { common: '共通', solution: 'ソリューション', engineering: 'エンジニア' };
+const STATS_SOURCE_CATS = ['common', 'solution', 'engineering'];
+const STATS_SOURCE_LABELS = { common: '共通', solution: 'ソリューション', engineering: 'エンジニアリング' };
 
 const state = {
   questions: [],          // [{id, category, question, answer, ...}]
@@ -54,6 +56,7 @@ const state = {
   studyStats: { again: 0, hard: 0, good: 0, easy: 0, total: 0 },
   selectedCat: 'all',
   selectedSize: 10,
+  statsSourceCat: 'common',  // source別統計で選択中のカテゴリ
   quiz: { active: [], idx: 0, results: [] },  // 解答モードの進行状態
   editingReturnView: null,  // 編集保存後の戻り先('view-study' or null→'view-list')
   listCat: 'all',
@@ -2716,9 +2719,17 @@ function renderDailyStudyTrend() {
 // 穴ごとの確定済み回答履歴から、日別の正解数・回答数を集計する。
 // rating 1 は不正解、rating 2/3/4 は正解。回答途中で中断した問題は
 // commitQuizProgress() が実行されないため、履歴にも正解率にも含まれない。
-function dailyBlankAccuracyByDate() {
+function dailyBlankAccuracyByDate(category = 'all') {
   const byDate = {};
-  for (const p of Object.values(state.progress)) {
+  const categoryByQuestion = category === 'all'
+    ? null
+    : new Map(state.questions.map(q => [String(q.id), q.category]));
+
+  for (const [progressKey, p] of Object.entries(state.progress)) {
+    if (categoryByQuestion) {
+      const qid = progressKeyQuestionId(progressKey);
+      if (categoryByQuestion.get(qid) !== category) continue;
+    }
     for (const h of (Array.isArray(p && p.history) ? p.history : [])) {
       const d = h && typeof h.d === 'string' ? h.d : '';
       const rating = Number(h && h.r);
@@ -2733,11 +2744,11 @@ function dailyBlankAccuracyByDate() {
 
 // 保存済みの穴履歴から、直近30日の「回答した穴数」を表示する。
 // 同じ穴を同じ日に複数回完了した場合も、回答した回数としてそれぞれ集計する。
-function renderDailyBlankStudyTrend() {
-  const el = document.getElementById('daily-blank-study-trend');
+function renderDailyBlankStudyTrend(elementId = 'daily-blank-study-trend', category = 'all', categoryLabel = '') {
+  const el = document.getElementById(elementId);
   if (!el) return;
 
-  const byDate = dailyBlankAccuracyByDate();
+  const byDate = dailyBlankAccuracyByDate(category);
   const now = startOfDay();
   const series = [];
   for (let i = 29; i >= 0; i--) {
@@ -2774,10 +2785,10 @@ function renderDailyBlankStudyTrend() {
       <div><span>30日合計</span><strong>${total30}</strong><small>穴</small></div>
       <div><span>最多</span><strong>${best}</strong><small>穴/日</small></div>
     </div>
-    <div class="daily-trend-scroll daily-blank-study-scroll" tabindex="0" aria-label="直近30日の日別学習穴あき数。横にスクロールできます">
+    <div class="daily-trend-scroll daily-blank-study-scroll" tabindex="0" aria-label="${categoryLabel ? categoryLabel + 'の' : ''}直近30日の日別学習穴あき数。横にスクロールできます">
       <div class="daily-trend-chart">${bars}</div>
     </div>
-    <p class="daily-trend-note">全ての対象穴を回答して「結果を見る」まで完了した問題について、回答した穴を1回ごとに集計します。回答途中で中断した問題は含めません。</p>`;
+    <p class="daily-trend-note">${categoryLabel ? categoryLabel + 'の問題に属する穴を対象に、' : ''}全ての対象穴を回答して「結果を見る」まで完了した問題について、回答した穴を1回ごとに集計します。回答途中で中断した問題は含めません。</p>`;
 
   const scroller = typeof el.querySelector === 'function' ? el.querySelector('.daily-blank-study-scroll') : null;
   if (scroller && typeof requestAnimationFrame === 'function') {
@@ -2795,11 +2806,11 @@ function blankAccuracySummary(series) {
   };
 }
 
-function renderDailyBlankAccuracyTrend() {
-  const el = document.getElementById('daily-blank-accuracy');
+function renderDailyBlankAccuracyTrend(elementId = 'daily-blank-accuracy', category = 'all', categoryLabel = '') {
+  const el = document.getElementById(elementId);
   if (!el) return;
 
-  const byDate = dailyBlankAccuracyByDate();
+  const byDate = dailyBlankAccuracyByDate(category);
   const now = startOfDay();
   const series = [];
   for (let i = 29; i >= 0; i--) {
@@ -2845,7 +2856,7 @@ function renderDailyBlankAccuracyTrend() {
       <div><span>直近30日</span><strong>${fmtPct(last30.accuracy)}</strong><small>${last30.accuracy == null ? '' : '%'}</small><em>${last30.total}穴</em></div>
       <div><span>学習日数</span><strong>${activeDays}</strong><small>日</small><em>30日中</em></div>
     </div>
-    <div class="daily-trend-scroll blank-accuracy-scroll" tabindex="0" aria-label="直近30日の日別穴あき正解率。横にスクロールできます">
+    <div class="daily-trend-scroll blank-accuracy-scroll" tabindex="0" aria-label="${categoryLabel ? categoryLabel + 'の' : ''}直近30日の日別穴あき正解率。横にスクロールできます">
       <div class="blank-accuracy-chart" role="img" aria-label="日ごとの穴あき正解率を0パーセントから100パーセントで表示">
         <div class="blank-accuracy-guide guide-100"><span>100%</span></div>
         <div class="blank-accuracy-guide guide-50"><span>50%</span></div>
@@ -2853,13 +2864,83 @@ function renderDailyBlankAccuracyTrend() {
         <div class="blank-accuracy-bars">${bars}</div>
       </div>
     </div>
-    <p class="daily-trend-note blank-accuracy-note">保存済みの穴履歴から日別集計します。正解率＝正解した穴数÷回答した穴数。全ての穴を回答して「結果を見る」まで完了した問題だけを集計し、回答途中で中断した問題は含めません。「やっぱり正解だった」は正解として集計します。</p>`;
+    <p class="daily-trend-note blank-accuracy-note">${categoryLabel ? categoryLabel + 'の問題に属する穴について、' : ''}保存済みの穴履歴から日別集計します。正解率＝正解した穴数÷回答した穴数。全ての穴を回答して「結果を見る」まで完了した問題だけを集計し、回答途中で中断した問題は含めません。「やっぱり正解だった」は正解として集計します。</p>`;
 
   // スマホでは直近の日付が最初に見えるよう、横スクロールを右端へ合わせる。
   const scroller = typeof el.querySelector === 'function' ? el.querySelector('.blank-accuracy-scroll') : null;
   if (scroller && typeof requestAnimationFrame === 'function') {
     requestAnimationFrame(() => { scroller.scrollLeft = scroller.scrollWidth; });
   }
+}
+
+
+function renderSourceBlankStatistics() {
+  const summaryEl = document.getElementById('source-blank-summary');
+  const detailEl = document.getElementById('source-blank-detail');
+  if (!summaryEl || !detailEl) return;
+
+  if (!STATS_SOURCE_CATS.includes(state.statsSourceCat)) state.statsSourceCat = 'common';
+
+  const rows = STATS_SOURCE_CATS.map(category => {
+    const questions = state.questions.filter(q => q.category === category);
+    const summary = blankProgressSummary(questions);
+    return { category, label: STATS_SOURCE_LABELS[category], summary };
+  });
+
+  summaryEl.innerHTML = rows.map(({ category, label, summary }) => {
+    const active = category === state.statsSourceCat;
+    return `<button type="button" class="source-summary-card${active ? ' active' : ''}" data-source-cat="${category}" aria-pressed="${active}">
+      <div class="source-summary-title"><span>${escapeHtml(label)}</span><strong>${summary.masteryRate}%</strong></div>
+      <div class="source-summary-count"><strong>${summary.mastered}</strong><span>/ ${summary.total}穴 習得</span></div>
+      <div class="source-summary-meta">
+        <span>総 ${summary.total}</span><span>学習中 ${summary.learning}</span><span>期限 ${summary.due}</span><span>未学習 ${summary.newq}</span><span>苦手 ${summary.leech}</span>
+      </div>
+    </button>`;
+  }).join('');
+
+  summaryEl.querySelectorAll('.source-summary-card[data-source-cat]').forEach(button => {
+    button.addEventListener('click', () => {
+      const category = button.dataset.sourceCat;
+      if (!STATS_SOURCE_CATS.includes(category) || category === state.statsSourceCat) return;
+      state.statsSourceCat = category;
+      renderSourceBlankStatistics();
+    });
+  });
+
+  const selected = rows.find(row => row.category === state.statsSourceCat) || rows[0];
+  const s = selected.summary;
+  const masteredWidth = s.total > 0 ? Math.max(0, Math.min(100, s.mastered / s.total * 100)) : 0;
+  const waiting = Math.max(0, s.learning - s.due);
+
+  detailEl.innerHTML = `<div class="source-detail-head">
+      <div><span>表示中のsource</span><strong>${escapeHtml(selected.label)}</strong></div>
+      <small>上のカードで切り替え</small>
+    </div>
+    <div class="stats-grid blank-stats-grid source-detail-stats-grid">
+      <div class="stat-card"><div class="stat-num">${s.total}</div><div class="stat-label">総穴あき数</div></div>
+      <div class="stat-card"><div class="stat-num">${s.mastered}</div><div class="stat-label">習得済穴</div></div>
+      <div class="stat-card"><div class="stat-num">${s.learning}</div><div class="stat-label">学習中穴</div></div>
+      <div class="stat-card"><div class="stat-num">${s.due}</div><div class="stat-label">復習期限穴</div></div>
+      <div class="stat-card"><div class="stat-num">${s.newq}</div><div class="stat-label">未学習穴</div></div>
+      <div class="stat-card"><div class="stat-num">${s.leech}</div><div class="stat-label">苦手穴</div></div>
+    </div>
+    <div class="blank-mastery-overview source-mastery-overview">
+      <div class="blank-overview-head"><span>${escapeHtml(selected.label)}の穴あき習得率</span><strong>${s.masteryRate}%</strong></div>
+      <div class="blank-overview-bar" role="progressbar" aria-label="${escapeHtml(selected.label)}の穴あき習得率" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${s.masteryRate}">
+        <span style="width:${masteredWidth}%"></span>
+      </div>
+      <div class="blank-overview-detail">
+        <span>習得済 ${s.mastered}穴</span><span>未習得 ${s.unmastered}穴</span><span>期日前 ${waiting}穴</span><span>復習期限 ${s.due}穴</span>
+      </div>
+    </div>
+    <h4 class="source-detail-section-title">1日で勉強した穴あき数の推移</h4>
+    <div id="source-daily-blank-study-trend" class="daily-study-trend daily-blank-study-trend"></div>
+    <h4 class="source-detail-section-title">日別穴あき正解率の推移</h4>
+    <div id="source-daily-blank-accuracy" class="daily-study-trend daily-blank-accuracy"></div>
+    <p class="source-stats-footnote">過去の穴履歴は、現在の問題CSVに設定されているカテゴリ（共通・ソリューション・エンジニアリング）に基づいてsource別に集計します。</p>`;
+
+  renderDailyBlankStudyTrend('source-daily-blank-study-trend', selected.category, selected.label);
+  renderDailyBlankAccuracyTrend('source-daily-blank-accuracy', selected.category, selected.label);
 }
 
 function renderStats() {
@@ -2892,6 +2973,7 @@ function renderStats() {
   renderDailyStudyTrend();
   renderDailyBlankStudyTrend();
   renderDailyBlankAccuracyTrend();
+  renderSourceBlankStatistics();
 
   // Heatmap (last 30 days / blank answers)
   const counts = {};
